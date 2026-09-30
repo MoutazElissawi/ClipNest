@@ -16,10 +16,6 @@ The viewer uses the editor's existing video canvas and Qt decoder. Display refre
 
 Finish recording, close the old app, extract this ZIP into a new folder, then run **Launch_ClipNest.vbs**. Settings, recordings, the OBS runtime and editor tool preferences are reused. Capture/replay, audio routing, exports, presets and notifications are unchanged.
 
-## Validation
-
-88 local tests passed, including real FFmpeg thumbnail/metadata extraction, Qt decoding of a paused first frame, newest-first scanning, exclusion of unfinished files, navigation/edit handoff, mute/volume controls without a physical audio backend, cancellation, and the original 83 regression tests. Gallery and player visually inspected offscreen. Test on Windows: open Clips & games, play an older clip, seek and adjust sound, use previous/next and Edit clip, then save a new replay and confirm its card appears.
-
 ---
 
 # ClipNest 1.2.0 — native recorder + clip editor
