@@ -10,6 +10,13 @@ Windows screen recording, instant replay, and clip editing, powered by OBS/libob
 - Compatible NVIDIA hardware/drivers for NVENC and AV1. CPU H.264 is also available.
 - Local NTFS storage for continuous replay and exports.
 
+
+## Screenshots
+<img width="1477" height="1039" alt="image" src="https://github.com/user-attachments/assets/b8735c63-1e02-4f9f-852e-2bd133064f11" />
+<img width="1477" height="1039" alt="image" src="https://github.com/user-attachments/assets/07f97bea-a0b0-4f7a-b8ed-030f42c9880f" />
+<img width="1702" height="989" alt="image" src="https://github.com/user-attachments/assets/253f4025-c638-4a65-bb76-a3451c62043e" />
+
+
 ## Launch
 
 Extract the ZIP and run Start_ClipNest.bat for first setup. Afterwards, use Launch_ClipNest.vbs. To update, finish recording, close the old app, and extract this release into a new folder. Existing settings and clips are retained.
