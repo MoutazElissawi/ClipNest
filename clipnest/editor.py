@@ -5,8 +5,8 @@ import threading
 import tempfile
 from fractions import Fraction
 
-from PySide6.QtCore import Qt, QThread, Signal, QUrl
-from PySide6.QtGui import QImage
+from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize
+from PySide6.QtGui import QImage, QIcon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -110,15 +110,47 @@ class Editor(QMainWindow):
         self.player.setVideoSink(self.video_sink)
         self.video.clipDropped.connect(self.open_clip)
         layout.addWidget(self.video, 1)
-        row = QHBoxLayout()
-        for label, callback in [('Open…', self.choose_clip), ('Browse clips…', self.browse_clips), ('Play / pause', self.play_pause),
-                                ('−1 frame', lambda: self.step_frame(-1)), ('+1 frame', lambda: self.step_frame(1))]:
-            b = QPushButton(label)
-            b.clicked.connect(callback)
-            row.addWidget(b)
+        def icon_button(name, tooltip, callback, large=False):
+            button = QPushButton()
+            button.setIcon(QIcon(str(Path(__file__).parent/'assets'/f'{name}.svg')))
+            button.setIconSize(QSize(30, 30) if large else QSize(20, 20))
+            button.setFixedSize(64, 40) if large else button.setFixedSize(40, 32)
+            button.setObjectName('transport' if large else 'compact')
+            button.setToolTip(tooltip)
+            button.setAccessibleName(tooltip)
+            button.clicked.connect(callback)
+            return button
+        transport = QHBoxLayout()
+        transport.setSpacing(8)
+        self.play_button = icon_button('play', 'Play / pause', self.play_pause, True)
+        transport.addWidget(self.play_button)
+        def playback_icon(state):
+            name = 'pause' if state == QMediaPlayer.PlaybackState.PlayingState else 'play'
+            self.play_button.setIcon(QIcon(str(Path(__file__).parent/'assets'/f'{name}.svg')))
+        self.player.playbackStateChanged.connect(playback_icon)
+        for label, tooltip, callback in [('Start', 'Set start here (A)', self.mark_start), ('End', 'Set end here (B)', self.mark_end)]:
+            button = QPushButton(label)
+            button.setFixedSize(80, 32)
+            button.setToolTip(tooltip)
+            button.clicked.connect(callback)
+            transport.addWidget(button)
+        steps = QHBoxLayout()
+        steps.setSpacing(8)
+        for text, direction in [('−1 frame', -1), ('+1 frame', 1)]:
+            button = QPushButton(text)
+            button.setObjectName('compact')
+            button.setFixedSize(80, 32)
+            button.setToolTip('Previous frame' if direction < 0 else 'Next frame')
+            button.setAccessibleName(button.toolTip())
+            button.clicked.connect(lambda checked=False, d=direction: self.step_frame(d))
+            steps.addWidget(button)
+        transport.addLayout(steps)
+        selection = QPushButton('Play selection')
+        selection.clicked.connect(self.play_selection)
+        transport.addWidget(selection)
+        transport.addStretch()
         self.clock = QLabel('0.0 / 0.0 s')
-        row.addWidget(self.clock)
-        layout.addLayout(row)
+        transport.addWidget(self.clock)
         preview_options = QHBoxLayout()
         self.show_edits = QCheckBox('Show crop / colors live')
         self.show_edits.setChecked(True)
@@ -132,6 +164,7 @@ class Editor(QMainWindow):
         preview_options.addWidget(QLabel('Speed'))
         preview_options.addWidget(self.speed)
         layout.addLayout(preview_options)
+        layout.addLayout(transport)
         self.wave = Waveform()
         self.wave.seek.connect(lambda ms: self.jump_marker(ms/1000))
         layout.addWidget(self.wave)
@@ -147,17 +180,14 @@ class Editor(QMainWindow):
         row.addWidget(self.start)
         row.addWidget(QLabel('End'))
         row.addWidget(self.end)
-        for label, callback in [('Set start here', self.mark_start), ('Set end here', self.mark_end), ('Play selection', self.play_selection)]:
-            b = QPushButton(label)
-            b.clicked.connect(callback)
-            row.addWidget(b)
+        for label, callback in [('Open clip…', self.choose_clip), ('Browse clips…', self.browse_clips)]:
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            row.addWidget(button)
+        row.addWidget(icon_button('jump-a', 'Go to A (selected start)', lambda: self.jump_marker(self.start.value())))
+        row.addWidget(icon_button('jump-b', 'Go to B (selected end)', lambda: self.jump_marker(self.end.value())))
+        row.addWidget(icon_button('crop', 'Drag crop corners', self.visual_crop))
         layout.addLayout(row)
-        marks = QHBoxLayout()
-        for label, callback in [('Go to A (selected start)', lambda: self.jump_marker(self.start.value())), ('Go to B (selected end)', lambda: self.jump_marker(self.end.value())), ('Drag crop corners…', self.visual_crop)]:
-            b = QPushButton(label)
-            b.clicked.connect(callback)
-            marks.addWidget(b)
-        layout.addLayout(marks)
         self.selection_playing = False
         audio_heading = QLabel('AUDIO • Select tracks and adjust volume')
         side.addWidget(audio_heading)
@@ -178,7 +208,7 @@ class Editor(QMainWindow):
         side.addWidget(self.remix)
         note = QLabel('Listen solo selects the waveform track. Combining excludes the existing Mix to avoid doubling.\nLive colors are approximate; Preview export checks final filters and audio. Solo volume is capped at 100%; export supports 200%.')
         note.setWordWrap(True)
-        note.setStyleSheet("font-size: 11px; color: #aebed2;")
+        note.setStyleSheet("font-size: 11px; color: #bfbfbf;")
         side.addWidget(note)
         preview_export = QPushButton('Preview export…')
         preview_export.clicked.connect(self.preview_export)

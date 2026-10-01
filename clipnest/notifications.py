@@ -5,7 +5,7 @@ from ctypes import wintypes
 import logging
 import os
 import time
-from PySide6.QtCore import Qt, QTimer, QRectF
+from PySide6.QtCore import Qt, QTimer, QRectF, QVariantAnimation, QEasingCurve
 from PySide6.QtGui import QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -20,7 +20,9 @@ class Toast(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setWindowTitle('ClipNest notification')
-        self.resize(360, 98)
+        self.resize(320, 76)
+        self.reveal = 1.0
+        self.slide_direction = 1
         self.title = self.detail = ''
         self.tone = 'success'
         self.capture_excluded = False
@@ -28,23 +30,25 @@ class Toast(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        accent = QColor('#ff8e9f' if self.tone == 'error' else '#6ae7ce')
-        p.setBrush(QColor(17, 26, 37, 247))
-        p.setPen(QPen(QColor('#35495f'), 1))
+        p.setOpacity(self.reveal)
+        p.translate(self.slide_direction * (1.0-self.reveal) * self.width(), 0)
+        accent = QColor('#ff8e9f' if self.tone == 'error' else '#a4d65e')
+        p.setBrush(QColor(20, 20, 20, 247))
+        p.setPen(QPen(QColor('#4a4a4a'), 1))
         p.drawRoundedRect(QRectF(1, 1, self.width()-2, self.height()-2), 12, 12)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(accent)
         p.drawRoundedRect(QRectF(1, 17, 4, self.height()-34), 2, 2)
         p.setPen(accent)
         p.setFont(QFont('Segoe UI', 8, QFont.Weight.DemiBold))
-        p.drawText(19, 21, 'CLIPNEST')
-        p.setPen(QColor('#eff6ff'))
+        p.drawText(16, 17, 'CLIPNEST')
+        p.setPen(QColor('#f7f7f7'))
         p.setFont(QFont('Segoe UI', 11, QFont.Weight.DemiBold))
-        p.drawText(19, 44, p.fontMetrics().elidedText(self.title, Qt.TextElideMode.ElideRight, self.width()-38))
-        p.setPen(QColor('#abc0d6'))
+        p.drawText(16, 38, p.fontMetrics().elidedText(self.title, Qt.TextElideMode.ElideRight, self.width()-32))
+        p.setPen(QColor('#c0c0c0'))
         p.setFont(QFont('Segoe UI', 9))
-        text = p.fontMetrics().elidedText(self.detail.replace('\n', ' '), Qt.TextElideMode.ElideRight, self.width()-38)
-        p.drawText(19, 70, text)
+        text = p.fontMetrics().elidedText(self.detail.replace('\n', ' '), Qt.TextElideMode.ElideRight, self.width()-32)
+        p.drawText(16, 59, text)
 
     def exclude_from_capture(self):
         if os.name != 'nt':
@@ -69,6 +73,31 @@ class Notifications:
         self.timer = QTimer(self.toast)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self.next)
+        self.active = False
+        self.exiting = False
+        self.animation = QVariantAnimation(self.toast)
+        self.animation.valueChanged.connect(self.animate_frame)
+        self.animation.finished.connect(self.animation_finished)
+
+    def animate_frame(self, value):
+        self.toast.reveal = float(value)
+        self.toast.update()
+
+    def animate(self, end, duration, curve):
+        self.animation.stop()
+        self.animation.setStartValue(self.toast.reveal)
+        self.animation.setEndValue(end)
+        self.animation.setDuration(duration)
+        self.animation.setEasingCurve(curve)
+        self.animation.start()
+
+    def animation_finished(self):
+        if self.exiting:
+            self.toast.hide()
+            self.active = False
+            self.exiting = False
+            if self.queue:
+                self.display(self.queue.popleft())
 
     def push(self, title, detail='', tone='success', force=False):
         if not force and not self.settings.get('notifications_enabled', True):
@@ -84,7 +113,7 @@ class Notifications:
             # Failures take priority; a start confirmation must not follow a stop error.
             self.queue.clear()
             self.display(item)
-        elif self.timer.isActive():
+        elif self.active:
             self.queue.append(item)
         else:
             self.display(item)
@@ -115,6 +144,14 @@ class Notifications:
         return chosen or QApplication.primaryScreen()
 
     def display(self, item):
+        self.timer.stop()
+        self.animation.stop()
+        self.exiting = False
+        self.active = True
+        self.toast.reveal = 0.0
+        self.toast.resize(320, 76 if item[1] else 54)
+        corner = self.settings.get('notification_corner', 'Top right')
+        self.toast.slide_direction = -1 if 'left' in corner else 1
         self.toast.title, self.toast.detail, self.toast.tone = item
         screen = self.screen()
         if screen:
@@ -127,15 +164,21 @@ class Notifications:
         self.toast.exclude_from_capture()
         self.toast.update()
         self.toast.show()
+        self.animate(1.0, 240, QEasingCurve.Type.OutCubic)
         duration = max(2, min(10, int(self.settings.get('notification_seconds', 3))))
         self.timer.start((max(6, duration) if item[2] == 'error' else duration)*1000)
 
     def next(self):
-        self.toast.hide()
-        if self.queue:
-            self.display(self.queue.popleft())
+        self.timer.stop()
+        if not self.active or self.exiting:
+            return
+        self.exiting = True
+        self.animate(0.0, 180, QEasingCurve.Type.InCubic)
 
     def close(self):
+        self.animation.stop()
+        self.active = False
+        self.exiting = False
         self.timer.stop()
         self.queue.clear()
         self.toast.close()

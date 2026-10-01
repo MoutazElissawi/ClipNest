@@ -32,7 +32,7 @@ class CropCanvas(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect_or_widget(), QColor('#090e16'))
+        p.fillRect(self.rect_or_widget(), QColor('#0f0f0f'))
         area = self.picture_rect()
         p.drawImage(area, self.image)
         scale = area.width()/self.source_width
@@ -43,7 +43,7 @@ class CropCanvas(QWidget):
         inside = QPainterPath()
         inside.addRect(r)
         p.fillPath(outside.subtracted(inside), QColor(65, 68, 74, 115))
-        p.setPen(QPen(QColor('#56d7ff'), 3))
+        p.setPen(QPen(QColor('#a4d65e'), 3))
         p.drawRect(r)
         p.setBrush(QColor('#ffffff'))
         for point in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()):

@@ -110,7 +110,7 @@ class GalleryScan(QThread):
 
 def card_icon(clip):
     canvas = QPixmap(256, 144)
-    canvas.fill(QColor('#182638'))
+    canvas.fill(QColor('#272727'))
     painter = QPainter(canvas)
     picture = QPixmap(clip.get('thumbnail', ''))
     if not picture.isNull():
@@ -118,7 +118,7 @@ def card_icon(clip):
                                  Qt.TransformationMode.SmoothTransformation)
         painter.drawPixmap((256-picture.width())//2, (144-picture.height())//2, picture)
     else:
-        painter.setPen(QColor('#8195ac'))
+        painter.setPen(QColor('#969696'))
         painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, '▶')
     label = clock(clip['duration']) if clip.get('duration') else 'VIDEO'
     painter.fillRect(8, 8, max(58, len(label)*9+14), 25, QColor(0, 0, 0, 190))
@@ -138,7 +138,7 @@ class RecentGallery(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
-        title = QLabel('RECENT CLIPS')
+        title = QLabel('Recent clips')
         title.setObjectName('eyebrow')
         row.addWidget(title)
         row.addStretch()
@@ -156,7 +156,7 @@ class RecentGallery(QWidget):
         self.list.setWordWrap(False)
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list.setUniformItemSizes(True)
-        self.list.setStyleSheet('QListWidget {border:0; background:transparent;} QListWidget::item {background:#151e2a; border:1px solid #26364b; border-radius:10px; padding:8px;} QListWidget::item:hover {border:1px solid #69e5cb; background:#1b2b36;} QListWidget::item:selected {border:1px solid #69e5cb; background:#203b3b;}')
+        self.list.setStyleSheet('QListWidget {border:0; background:transparent;} QListWidget::item {background:transparent; border:1px solid transparent; border-radius:4px; padding:8px;} QListWidget::item:hover {border:1px solid #959595; background:#2e2e2e;} QListWidget::item:selected {border:1px solid #76b900; background:#76b900;}')
         self.list.itemClicked.connect(self.open_item)
         self.list.itemActivated.connect(self.open_item)
         layout.addWidget(self.list, 1)
@@ -247,7 +247,7 @@ class QuickPlayer(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setContentsMargins(16, 16, 16, 16)
         row = QHBoxLayout()
         self.title = QLabel('Clip')
         self.title.setObjectName('pageTitle')
@@ -271,7 +271,7 @@ class QuickPlayer(QMainWindow):
         stage.addWidget(self.video, 0, 0)
         self.center_play = QPushButton('▶')
         self.center_play.setFixedSize(76, 76)
-        self.center_play.setStyleSheet('QPushButton {background:#131c27; color:white; border:1px solid #62778c; border-radius:38px; font-size:28px;}')
+        self.center_play.setStyleSheet('QPushButton {background:#1d1d1d; color:white; border:1px solid #777777; border-radius:38px; font-size:28px;}')
         self.center_play.clicked.connect(self.toggle)
         stage.addWidget(self.center_play, 0, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addLayout(stage, 1)

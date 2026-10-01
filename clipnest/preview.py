@@ -109,17 +109,17 @@ class VideoCanvas(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor('#080d15'))
+        p.fillRect(self.rect(), QColor('#0e0e0e'))
         if not self.display.isNull():
             size = self.display.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
             area = QRectF((self.width()-size.width())/2, (self.height()-size.height())/2, size.width(), size.height())
             p.drawImage(area, self.display)
         else:
-            p.setPen(QColor('#b6c8df'))
+            p.setPen(QColor('#cacaca'))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 'Drop a clip here\nor use Open / Browse clips')
         if self.hover:
-            p.fillRect(self.rect(), QColor(58, 137, 207, 80))
-            p.setPen(QPen(QColor('#91caff'), 3))
+            p.fillRect(self.rect(), QColor(118, 185, 0, 80))
+            p.setPen(QPen(QColor('#c9c9c9'), 3))
             p.drawRect(self.rect().adjusted(2, 2, -3, -3))
 
 
@@ -151,15 +151,15 @@ class Waveform(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor('#101824'))
+        p.fillRect(self.rect(), QColor('#191919'))
         w, h = self.width(), self.height()
         if self.duration:
             a, b = self.start/self.duration*w, self.end/self.duration*w
-            p.fillRect(QRectF(a, 0, max(0, b-a), h), QColor('#233f5d'))
-            p.setPen(QColor('#91caff'))
+            p.fillRect(QRectF(a, 0, max(0, b-a), h), QColor('#404040'))
+            p.setPen(QColor('#c9c9c9'))
             p.drawText(int(a)+3, 13, 'A')
             p.drawText(max(0, min(w-13, int(b)-13)), 13, 'B')
-        p.setPen(QPen(QColor('#77cbd3'), 1))
+        p.setPen(QPen(QColor('#76b900'), 1))
         for i, peak in enumerate(self.peaks):
             x = round(i*w/max(1, len(self.peaks)-1))
             amp = float(peak)*(h/2-16)
@@ -168,5 +168,5 @@ class Waveform(QWidget):
             p.setPen(QPen(QColor('#ffffff'), 2))
             x = round(self.position/self.duration/1000*w)
             p.drawLine(x, 0, x, h)
-        p.setPen(QColor('#d2dfec'))
+        p.setPen(QColor('#dfdfdf'))
         p.drawText(6, h-4, self.label)
