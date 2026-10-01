@@ -14,6 +14,17 @@ OBS_URL = f"https://github.com/obsproject/obs-studio/releases/download/{OBS_VERS
 OBS_SHA256 = "4d6e40e3ab155f56b30de517380566a206d74b63cdf5ad49aa596924768f97e1"
 
 
+REQUIRED = ["bin/64bit/obs.dll", "bin/64bit/libobs-d3d11.dll", "bin/64bit/obs-ffmpeg-mux.exe", "bin/64bit/obs-nvenc-test.exe",
+                "obs-plugins/64bit/win-capture.dll", "obs-plugins/64bit/win-wasapi.dll",
+                "obs-plugins/64bit/obs-ffmpeg.dll", "obs-plugins/64bit/obs-nvenc.dll", "obs-plugins/64bit/obs-x264.dll"]
+
+
+def is_ready():
+    marker = ENGINE / "clipnest-engine-version.txt"
+    return (marker.is_file() and marker.read_text().strip() == OBS_VERSION
+            and all((ENGINE / name).is_file() for name in REQUIRED))
+
+
 def setup():
     import struct
     if struct.calcsize("P") != 8:
@@ -21,10 +32,7 @@ def setup():
     if os.name != "nt":
         raise RuntimeError("ClipNest capture requires Windows 10/11 x64.")
     marker = ENGINE / "clipnest-engine-version.txt"
-    required = ["bin/64bit/obs.dll", "bin/64bit/libobs-d3d11.dll", "bin/64bit/obs-ffmpeg-mux.exe", "bin/64bit/obs-nvenc-test.exe",
-                "obs-plugins/64bit/win-capture.dll", "obs-plugins/64bit/win-wasapi.dll",
-                "obs-plugins/64bit/obs-ffmpeg.dll", "obs-plugins/64bit/obs-nvenc.dll", "obs-plugins/64bit/obs-x264.dll"]
-    if marker.exists() and marker.read_text().strip() == OBS_VERSION and all((ENGINE / name).exists() for name in required):
+    if is_ready():
         return
     DATA.mkdir(parents=True, exist_ok=True)
     archive = DATA / "obs-download.zip"

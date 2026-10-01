@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QAbstractNativeEventFilter, QUrl
-from PySide6.QtGui import QDesktopServices, QAction, QIcon, QPixmap, QColor, QPainter
+from PySide6.QtGui import QDesktopServices, QAction
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTabWidget, QGroupBox, QFormLayout, QLineEdit, QSpinBox,
     QComboBox, QSlider, QProgressBar, QPlainTextEdit, QFileDialog, QMessageBox,
@@ -23,17 +23,7 @@ from .theme import STYLE
 from .notifications import Notifications
 
 
-def icon():
-    pix = QPixmap(64, 64)
-    pix.fill(QColor("#253b59"))
-    p = QPainter(pix)
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor("#a9ceff"))
-    p.drawRoundedRect(12, 17, 40, 30, 7, 7)
-    p.setBrush(QColor("#253b59"))
-    p.drawEllipse(25, 25, 14, 14)
-    p.end()
-    return QIcon(pix)
+from .branding import app_icon as icon
 
 
 class NativeHotkeys(QAbstractNativeEventFilter):
@@ -61,7 +51,7 @@ class Window(QMainWindow):
         self.last_app = {}
         self.last_mic = None
         self.device_data = {}
-        self.setWindowTitle("ClipNest 1.4.1 • Native recorder + editor")
+        self.setWindowTitle("ClipNest 1.5.1 • Native recorder + editor")
         self.setWindowIcon(icon())
         self.resize(1180, 800)
         self.setMinimumSize(1000, 720)
@@ -100,7 +90,7 @@ class Window(QMainWindow):
         navigation.addWidget(self.connection_badge)
         navigation.addSpacing(12)
         navigation.addWidget(self.button('Minimize to tray', self.hide_to_tray, 'quiet'))
-        version = QLabel('v1.4.1')
+        version = QLabel('v1.5.1')
         version.setObjectName('muted')
         navigation.addWidget(version)
         outer.addWidget(rail)

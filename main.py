@@ -9,12 +9,18 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from clipnest.config import DATA, SETTINGS, load_settings, atomic_json
 from clipnest.ui import Window
+from clipnest.branding import app_icon, set_windows_app_id
 
 
 def main():
     preview = "--preview" in sys.argv
+    if not preview:
+        from clipnest.install_support import hold_install_mutex
+        hold_install_mutex()
+    set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName("ClipNest")
+    app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
     DATA.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(DATA / "clipnest.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
@@ -27,6 +33,10 @@ def main():
         QMessageBox.warning(None, "Windows required", "Recording requires Windows 10/11 x64. Use --preview to inspect the interface here.")
         return 1
     try:
+        if not preview and (Path(__file__).parent / "runtime/pythonw.exe").is_file():
+            from clipnest.first_setup import ensure_runtime
+            if not ensure_runtime():
+                return 1
         settings = load_settings()
         if not preview:
             atomic_json(SETTINGS, settings)

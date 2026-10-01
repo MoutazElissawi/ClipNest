@@ -57,12 +57,13 @@ class VideoCanvas(QWidget):
         self.pending_frame = None
         self.frame_timer = QTimer(self)
         self.frame_timer.setSingleShot(True)
-        self.frame_timer.setInterval(33)
+        self.frame_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.frame_timer.setInterval(16)
         self.frame_timer.timeout.connect(self.flush_frame)
 
     def frame_changed(self, frame):
         if frame.isValid():
-            # Coalesce to at most 30 preview updates/s; never queue old images.
+            # Coalesce within a 16 ms budget for 60 fps playback; never queue old images.
             self.pending_frame = frame
             if not self.frame_timer.isActive():
                 self.frame_timer.start()

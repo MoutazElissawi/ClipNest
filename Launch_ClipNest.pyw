@@ -34,7 +34,7 @@ def launch():
                 log.write(details+'\n')
         except OSError:
             pass
-        message = f'ClipNest could not start:\n\n{exc}\n\nRun Start_ClipNest.bat to repair setup.\nDetails: {log_path}'
+        message = f'ClipNest could not start:\n\n{exc}\n\nSee launcher.log for details. For an installed copy, rerun the installer; for a source ZIP, run Start_ClipNest.bat.\nDetails: {log_path}'
         if os.name == 'nt':
             import ctypes
             ctypes.windll.user32.MessageBoxW(None, message, 'ClipNest startup error', 0x10)

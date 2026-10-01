@@ -29,6 +29,7 @@ def host_command(env):
             if pattern.startswith("vcruntime") and (target / dll.name).exists():
                 continue
             shutil.copy2(dll, target / dll.name)
+    env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONHOME"] = str(base)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     env["PATH"] = str(base) + os.pathsep + env.get("PATH", "")

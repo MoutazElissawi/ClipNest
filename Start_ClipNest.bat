@@ -1,6 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+if exist "runtime\pythonw.exe" (
+    start "" "runtime\pythonw.exe" -s -E "Launch_ClipNest.pyw"
+    exit /b 0
+)
 if exist ".venv\Scripts\python.exe" goto ready
 where py >nul 2>nul
 if errorlevel 1 goto trypython

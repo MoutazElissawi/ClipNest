@@ -8,11 +8,11 @@ from pathlib import Path
 import tempfile
 import threading
 
-from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QTimer, QFile
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QDesktopServices, QShortcut, QKeySequence, QImage
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QMediaMetaData, QVideoSink
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QListWidget, QListWidgetItem, QListView, QMainWindow, QSlider)
+    QPushButton, QListWidget, QListWidgetItem, QListView, QMainWindow, QSlider, QMessageBox)
 from .config import DATA
 from .editor_assets import thumbnail, captured_file
 from .media import tools_path
@@ -142,6 +142,10 @@ class RecentGallery(QWidget):
         title.setObjectName('eyebrow')
         row.addWidget(title)
         row.addStretch()
+        self.delete_button = QPushButton('Delete clip…')
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self.delete_selected)
+        row.addWidget(self.delete_button)
         refresh = QPushButton('Refresh')
         refresh.clicked.connect(self.refresh)
         row.addWidget(refresh)
@@ -157,13 +161,38 @@ class RecentGallery(QWidget):
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list.setUniformItemSizes(True)
         self.list.setStyleSheet('QListWidget {border:0; background:transparent;} QListWidget::item {background:transparent; border:1px solid transparent; border-radius:4px; padding:8px;} QListWidget::item:hover {border:1px solid #959595; background:#2e2e2e;} QListWidget::item:selected {border:1px solid #76b900; background:#76b900;}')
-        self.list.itemClicked.connect(self.open_item)
+        self.list.itemSelectionChanged.connect(lambda: self.delete_button.setEnabled(bool(self.list.selectedItems())))
         self.list.itemActivated.connect(self.open_item)
         layout.addWidget(self.list, 1)
         self.status = QLabel('Your latest 24 clips appear here, including previous sessions.')
         self.status.setObjectName('muted')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+
+    def delete_selected(self):
+        selected = self.list.selectedItems()
+        if not selected:
+            return
+        path = Path(selected[0].data(Qt.ItemDataRole.UserRole))
+        answer = QMessageBox.question(self, 'Delete clip?',
+            f'Move this clip to the Recycle Bin?\n\n{path.name}\n\n{path.parent}',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        # Never fall back to permanent removal when trash is unavailable.
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise OSError('The clip is missing or is no longer a regular file.')
+            result = QFile.moveToTrash(str(path))
+            success = result[0] if isinstance(result, tuple) else result
+            if not success:
+                raise OSError('Could not move the clip to the Recycle Bin. Close it in the player/editor or other applications and try again.')
+        except OSError as error:
+            QMessageBox.warning(self, 'Clip was not deleted', str(error))
+            return
+        self.listed([clip for clip in self.clips if clip['path'] != str(path)], [])
+        self.refresh()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -202,7 +231,7 @@ class RecentGallery(QWidget):
             item.setToolTip(clip['path'])
             self.list.addItem(item)
             self.items[clip['path']] = item
-        text = f'{len(clips)} recent clips · Click to watch' if clips else 'No saved clips yet. Your next saved clip will appear here.'
+        text = f'{len(clips)} recent clips · Select a clip to delete · Double-click to watch' if clips else 'No saved clips yet. Your next saved clip will appear here.'
         if errors:
             text += ' · Some folders could not be read'
         if not gallery_tools()[0]:

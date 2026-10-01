@@ -369,6 +369,8 @@ class NativeEngine:
 
 
 def main():
+    from .install_support import hold_install_mutex
+    hold_install_mutex()
     faulthandler.enable(file=sys.stderr, all_threads=True)
     protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", buffering=1)
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
