@@ -9,15 +9,18 @@ import tempfile
 import threading
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QTimer, QFile
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QDesktopServices, QShortcut, QKeySequence, QImage
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QDesktopServices, QShortcut, QKeySequence, QImage, QGuiApplication
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QMediaMetaData, QVideoSink
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QListWidget, QListWidgetItem, QListView, QMainWindow, QSlider, QMessageBox)
+    QPushButton, QListWidget, QListWidgetItem, QListView, QMainWindow, QSlider, QMessageBox, QLineEdit, QCheckBox, QInputDialog)
 from .config import DATA
 from .editor_assets import thumbnail, captured_file
 from .media import tools_path
 from .preview import VIDEO_EXTENSIONS, VideoCanvas
-from .theme import STYLE
+from .theme import apply_theme
+from .desktop import SmoothList, DefaultAudioOutput, show_centered, reveal_file
+from .window_frame import DesktopWindow
+from .library import Annotations, matches, linked
 
 
 def clock(seconds):
@@ -35,7 +38,7 @@ def recent_clips(root, cancel, limit=24):
         if cancel.is_set():
             return [], errors
         folders[:] = [f for f in folders if not f.startswith('.') and f not in ('_Unsorted', '_ReplayCache')
-                      and not (Path(directory)/f).is_symlink()]
+                      and not linked(Path(directory)/f)]
         for name in files:
             if cancel.is_set():
                 return [], errors
@@ -79,6 +82,10 @@ class GalleryScan(QThread):
 
     def run(self):
         clips, errors = recent_clips(self.root, self.cancel)
+        try:
+            Annotations().annotate(clips)
+        except Exception as exc:
+            errors.append('Annotations unavailable: ' + str(exc))
         self.listed.emit(clips, errors)
         ffmpeg, ffprobe = gallery_tools()
         if not ffmpeg:
@@ -109,14 +116,17 @@ class GalleryScan(QThread):
 
 
 def card_icon(clip):
-    canvas = QPixmap(256, 144)
+    ratio = max((screen.devicePixelRatio() for screen in QGuiApplication.screens()), default=1.0)
+    canvas = QPixmap(round(256*ratio), round(144*ratio))
+    canvas.setDevicePixelRatio(ratio)
     canvas.fill(QColor('#272727'))
     painter = QPainter(canvas)
     picture = QPixmap(clip.get('thumbnail', ''))
     if not picture.isNull():
-        picture = picture.scaled(256, 144, Qt.AspectRatioMode.KeepAspectRatio,
+        picture = picture.scaled(canvas.width(), canvas.height(), Qt.AspectRatioMode.KeepAspectRatio,
                                  Qt.TransformationMode.SmoothTransformation)
-        painter.drawPixmap((256-picture.width())//2, (144-picture.height())//2, picture)
+        picture.setDevicePixelRatio(ratio)
+        painter.drawPixmap(round((256-picture.width()/ratio)/2), round((144-picture.height()/ratio)/2), picture)
     else:
         painter.setPen(QColor('#969696'))
         painter.drawText(canvas.rect(), Qt.AlignmentFlag.AlignCenter, '▶')
@@ -150,18 +160,36 @@ class RecentGallery(QWidget):
         refresh.clicked.connect(self.refresh)
         row.addWidget(refresh)
         layout.addLayout(row)
-        self.list = QListWidget()
+        self.annotations = Annotations()
+        from .storage_widget import StorageWidget
+        self.storage = StorageWidget(self.root, getattr(parent, 'settings', {}).get('storage_limit_gb', 0), self)
+        layout.addWidget(self.storage)
+        filters = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText('Search recent clips: game, name, YYYY-MM-DD, tag…')
+        self.favorites = QCheckBox('Favorites only')
+        filters.addWidget(self.search, 1)
+        filters.addWidget(self.favorites)
+        for label, action in [('Favorite / unfavorite', self.favorite_selected), ('Tags…', self.tag_selected), ('Combine…', self.combine_selected)]:
+            button = QPushButton(label)
+            button.clicked.connect(action)
+            filters.addWidget(button)
+        layout.addLayout(filters)
+        self.search.textChanged.connect(self.filter_clips)
+        self.favorites.toggled.connect(self.filter_clips)
+        self.list = SmoothList()
         self.list.setViewMode(QListView.ViewMode.IconMode)
         self.list.setResizeMode(QListView.ResizeMode.Adjust)
         self.list.setMovement(QListView.Movement.Static)
         self.list.setIconSize(QSize(256, 144))
         self.list.setGridSize(QSize(282, 216))
         self.list.setSpacing(8)
+        self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list.setWordWrap(False)
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list.setUniformItemSizes(True)
-        self.list.setStyleSheet('QListWidget {border:0; background:transparent;} QListWidget::item {background:transparent; border:1px solid transparent; border-radius:4px; padding:8px;} QListWidget::item:hover {border:1px solid #959595; background:#2e2e2e;} QListWidget::item:selected {border:1px solid #76b900; background:#76b900;}')
-        self.list.itemSelectionChanged.connect(lambda: self.delete_button.setEnabled(bool(self.list.selectedItems())))
+        self.list.setStyleSheet('QListWidget {border:0; background:transparent;} QListWidget::item {background:transparent; border:1px solid transparent; border-radius:4px; padding:8px;} QListWidget::item:hover {border:1px solid #959595; background:#2e2e2e;} QListWidget::item:selected {border:1px solid #76b900; background:rgba(118,185,0,28);}')
+        self.list.itemSelectionChanged.connect(lambda: self.delete_button.setEnabled(len(self.list.selectedItems()) == 1))
         self.list.itemActivated.connect(self.open_item)
         layout.addWidget(self.list, 1)
         self.status = QLabel('Your latest 24 clips appear here, including previous sessions.')
@@ -171,7 +199,7 @@ class RecentGallery(QWidget):
 
     def delete_selected(self):
         selected = self.list.selectedItems()
-        if not selected:
+        if len(selected) != 1:
             return
         path = Path(selected[0].data(Qt.ItemDataRole.UserRole))
         answer = QMessageBox.question(self, 'Delete clip?',
@@ -205,6 +233,7 @@ class RecentGallery(QWidget):
             self.pending = True
             self.worker.cancel.set()
             return
+        self.storage.refresh()
         self.status.setText('Looking for recent clips…')
         self.worker = GalleryScan(self.root, self)
         self.worker.listed.connect(self.listed)
@@ -223,20 +252,74 @@ class RecentGallery(QWidget):
     def listed(self, clips, errors):
         if self.stopped or (self.sender() and getattr(self.sender(), 'cancel', threading.Event()).is_set()):
             return
-        self.clips, self.items = clips, {}
+        self.clips = clips
+        self.render_clips()
+        self.items = {self.list.item(i).data(Qt.ItemDataRole.UserRole): self.list.item(i) for i in range(self.list.count())}
+        text = f"{len(clips)} recent clips · Ctrl-click to select several · Double-click to watch"
+        if errors:
+            text += " · Some folders could not be read"
+        self.status.setText(text)
+
+    def filter_clips(self, *_):
+        self.render_clips()
+
+    def render_clips(self):
+        clips = [c for c in self.clips if matches(c, self.search.text(), self.favorites.isChecked())]
+        self.items = {}
         self.list.clear()
         for clip in clips:
-            item = QListWidgetItem(card_icon(clip), f"{clip['folder']}\n{datetime.fromtimestamp(clip['modified']):%b %d · %H:%M}\n{clip['name']}")
+            item = QListWidgetItem(card_icon(clip), f"{'★ ' if clip.get('favorite') else ''}{clip['folder']}\n{datetime.fromtimestamp(clip['modified']):%b %d · %H:%M}\n{clip['name']}")
             item.setData(Qt.ItemDataRole.UserRole, clip['path'])
-            item.setToolTip(clip['path'])
+            item.setToolTip(clip['path'] + '\nTags: ' + ', '.join(clip.get('tags', [])))
             self.list.addItem(item)
             self.items[clip['path']] = item
         text = f'{len(clips)} recent clips · Select a clip to delete · Double-click to watch' if clips else 'No saved clips yet. Your next saved clip will appear here.'
-        if errors:
-            text += ' · Some folders could not be read'
+
         if not gallery_tools()[0]:
             text += ' · Set File → FFmpeg folder in the editor for thumbnails and clip details'
         self.status.setText(text)
+
+    def selected_paths(self):
+        return [item.data(Qt.ItemDataRole.UserRole) for item in self.list.selectedItems()]
+
+    def favorite_selected(self):
+        paths = self.selected_paths()
+        selected = [c for c in self.clips if c['path'] in paths]
+        value = not all(c.get('favorite', False) for c in selected)
+        try:
+            for clip in selected:
+                self.annotations.set(clip['path'], favorite=value)
+                clip['favorite'] = value
+            self.render_clips()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Favorites', str(exc))
+
+    def tag_selected(self):
+        paths = self.selected_paths()
+        if not paths:
+            return
+        first = next(c for c in self.clips if c['path'] == paths[0])
+        text, ok = QInputDialog.getText(self, 'Clip tags', 'Comma-separated tags (replaces tags on selected clips):', text=', '.join(first.get('tags', [])))
+        if ok:
+            try:
+                for clip in self.clips:
+                    if clip['path'] in paths:
+                        self.annotations.set(clip['path'], tags=text.split(','))
+                        clip['tags'] = [tag.strip() for tag in text.split(',') if tag.strip()]
+                self.render_clips()
+            except Exception as exc:
+                QMessageBox.warning(self, 'Tags', str(exc))
+
+    def combine_selected(self):
+        from .join_dialog import JoinDialog
+        paths = self.selected_paths()
+        if len(paths) < 2:
+            QMessageBox.information(self, 'Combine clips', 'Ctrl-click two or more clips first.')
+            return
+        dialog = JoinDialog(paths, self)
+        dialog.exec()
+        dialog.deleteLater()
+        self.refresh()
 
     def asset_ready(self, path, details):
         if self.stopped or (self.sender() and getattr(self.sender(), 'cancel', threading.Event()).is_set()):
@@ -255,22 +338,24 @@ class RecentGallery(QWidget):
             self.opened.emit(self.clips, index)
 
     def stop(self):
+        self.storage.stop()
         self.stopped = True
         if self.worker:
             self.worker.cancel.set()
             self.worker.wait()
 
 
-class QuickPlayer(QMainWindow):
+class QuickPlayer(DesktopWindow):
     edit_requested = Signal(str)
     def __init__(self, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
         self.setWindowTitle('ClipNest • Watch clip')
-        self.setStyleSheet(STYLE)
+        theme = getattr(parent, 'current_theme', parent.settings.get('ui_theme', 'dark')) if parent is not None and hasattr(parent, 'settings') else 'dark'
+        apply_theme(self, theme)
         self.resize(1160, 760)
         self.clips, self.index = [], -1
         self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
+        self.audio = DefaultAudioOutput(self)
         self.audio.setVolume(.75)
         self.player.setAudioOutput(self.audio)
         root = QWidget()
@@ -300,7 +385,7 @@ class QuickPlayer(QMainWindow):
         stage.addWidget(self.video, 0, 0)
         self.center_play = QPushButton('▶')
         self.center_play.setFixedSize(76, 76)
-        self.center_play.setStyleSheet('QPushButton {background:#1d1d1d; color:white; border:1px solid #777777; border-radius:38px; font-size:28px;}')
+        self.center_play.setStyleSheet('QPushButton {background:#1d1d1d; color:white; border:1px solid #777777; border-radius:38px; font-size:28px; outline:0;} QPushButton:focus {border-color:#a4d65e;}')
         self.center_play.clicked.connect(self.toggle)
         stage.addWidget(self.center_play, 0, 0, Qt.AlignmentFlag.AlignCenter)
         layout.addLayout(stage, 1)
@@ -358,9 +443,7 @@ class QuickPlayer(QMainWindow):
     def open_clips(self, clips, index):
         self.clips = [dict(c) for c in clips]
         self.open_index(index)
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        show_centered(self, self.parentWidget())
 
     def open_index(self, index):
         if not 0 <= index < len(self.clips):
@@ -434,7 +517,7 @@ class QuickPlayer(QMainWindow):
 
     def open_folder(self):
         if self.index >= 0:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(self.clips[self.index]['path']).parent)))
+            reveal_file(self.clips[self.index]['path'])
 
     def edit(self):
         if self.index >= 0:

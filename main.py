@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from clipnest.config import DATA, SETTINGS, load_settings, atomic_json
 from clipnest.ui import Window
 from clipnest.branding import app_icon, set_windows_app_id
+from clipnest import __version__
 
 
 def main():
@@ -40,12 +41,18 @@ def main():
         settings = load_settings()
         if not preview:
             atomic_json(SETTINGS, settings)
+        if '--safe-ui' in sys.argv:
+            settings['ui_theme'] = 'dark'
+        logging.info('ClipNest %s; source=%s; executable=%s; theme=%s; tint=%s; safe_ui=%s',
+                     __version__, Path(__file__).resolve(), sys.executable, settings['ui_theme'],
+                     settings['glass_tint'], '--safe-ui' in sys.argv)
         window = Window(settings, preview=preview)
     except Exception as exc:
         logging.exception("Startup failed")
         QMessageBox.critical(None, "Startup error", str(exc))
         return 1
-    window.show()
+    from clipnest.desktop import show_centered
+    show_centered(window)
     result = app.exec()
     lock.unlock()
     return result

@@ -4,23 +4,28 @@ import copy
 import ctypes
 from ctypes import wintypes
 import math
+import logging
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QAbstractNativeEventFilter, QUrl
-from PySide6.QtGui import QDesktopServices, QAction
+from PySide6.QtCore import Qt, QTimer, QAbstractNativeEventFilter, QUrl, QSize
+from PySide6.QtGui import QDesktopServices, QAction, QIcon
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTabWidget, QGroupBox, QFormLayout, QLineEdit, QSpinBox,
     QComboBox, QSlider, QProgressBar, QPlainTextEdit, QFileDialog, QMessageBox,
-    QListWidget, QListWidgetItem, QInputDialog, QSystemTrayIcon, QMenu, QScrollArea, QCheckBox)
+    QListWidget, QListWidgetItem, QInputDialog, QSystemTrayIcon, QMenu, QScrollArea, QCheckBox, QLayout, QSizePolicy)
 
-from .config import DATA, ENCODERS
+from .config import DATA, ENCODERS, save_appearance as persist_appearance
+from . import __version__
 from .engine import Engine, MIC, DESKTOP
 from .hotkeys import Hotkeys, held, parse_hotkey
 from .shortcut_field import ShortcutField
 
-from .theme import STYLE
+from .theme import apply_theme, normalize_theme
 from .notifications import Notifications
+from .desktop import show_centered
+from .window_frame import DesktopWindow
+from .system_events import SystemEvents
 
 
 from .branding import app_icon as icon
@@ -30,19 +35,25 @@ class NativeHotkeys(QAbstractNativeEventFilter):
     def __init__(self, callback):
         super().__init__()
         self.callback = callback
+        self.system_events = None
 
     def nativeEventFilter(self, event_type, message):
         if os.name == "nt" and bytes(event_type) in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
             msg = wintypes.MSG.from_address(int(message))
+            if self.system_events is not None and msg.message in (0x0218, 0x02B1, 0x007E):
+                try:
+                    self.system_events.handle_message(msg.hwnd, msg.message, msg.wParam)
+                except Exception:
+                    logging.getLogger('clipnest').exception('Windows lifecycle event failed')
             if msg.message == 0x0312 and msg.wParam in (101, 102):
                 self.callback("save_replay" if msg.wParam == 101 else "toggle_record")
                 return True, 0
         return False, 0
 
 
-class Window(QMainWindow):
+class Window(DesktopWindow):
     def __init__(self, settings, preview=False):
-        super().__init__()
+        super().__init__(theme=normalize_theme(settings.get('ui_theme', 'dark')))
         self.settings = copy.deepcopy(settings)
         self.preview = preview
         self.connected = self.recording = self.replay = False
@@ -51,34 +62,46 @@ class Window(QMainWindow):
         self.last_app = {}
         self.last_mic = None
         self.device_data = {}
-        self.setWindowTitle("ClipNest 1.5.1 • Native recorder + editor")
+        self.setWindowTitle(f"ClipNest {__version__} • Native recorder + editor")
         self.setWindowIcon(icon())
-        self.resize(1180, 800)
-        self.setMinimumSize(1000, 720)
-        self.setStyleSheet(STYLE)
+        self.resize(1260, 900)
+        self.setMinimumSize(960, 600)
+        self.set_glass_tint(settings.get("glass_tint", 46))
+        self.current_theme = normalize_theme(self.settings.get("ui_theme", "dark"))
+        apply_theme(self, self.current_theme)
         self.engine = Engine(settings)
         self.hotkeys = Hotkeys()
         self.capturing_shortcut = False
         self.notifications = Notifications(self.settings)
         self.native_filter = NativeHotkeys(self.submit)
         QApplication.instance().installNativeEventFilter(self.native_filter)
+        self.system_events = SystemEvents(self, self.submit) if not preview else None
+        self.native_filter.system_events = self.system_events
 
         shell = QWidget()
+        shell.setObjectName('shell')
         outer = QHBoxLayout(shell)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         rail = QWidget()
         rail.setObjectName('rail')
-        rail.setFixedWidth(176)
+        rail.setFixedWidth(200)
         navigation = QVBoxLayout(rail)
         navigation.setContentsMargins(16, 24, 16, 16)
         brand = QLabel('ClipNest')
         brand.setObjectName('brand')
-        navigation.addWidget(brand)
+        brand_row = QHBoxLayout()
+        emblem = QLabel()
+        emblem.setPixmap(self.windowIcon().pixmap(32, 32))
+        brand_row.addWidget(emblem)
+        brand_row.addWidget(brand, 1)
+        navigation.addLayout(brand_row)
         navigation.addSpacing(24)
         self.nav_buttons = {}
         for index, label in ((0, 'Capture'), (2, 'Clips && games'), (1, 'Settings')):
             button = self.button(label, lambda checked=False, i=index: self.tabs.setCurrentIndex(i), 'nav')
+            button.setIcon(QIcon(str(Path(__file__).parent/'assets'/('ui-'+{0:'capture', 2:'clips', 1:'settings'}[index]+'.svg'))))
+            button.setIconSize(QSize(22, 22))
             button.setCheckable(True)
             self.nav_buttons[index] = button
             navigation.addWidget(button)
@@ -90,7 +113,7 @@ class Window(QMainWindow):
         navigation.addWidget(self.connection_badge)
         navigation.addSpacing(12)
         navigation.addWidget(self.button('Minimize to tray', self.hide_to_tray, 'quiet'))
-        version = QLabel('v1.5.1')
+        version = QLabel(f'v{__version__}')
         version.setObjectName('muted')
         navigation.addWidget(version)
         outer.addWidget(rail)
@@ -178,10 +201,25 @@ class Window(QMainWindow):
         for i, button in self.nav_buttons.items():
             button.setChecked(i == index)
 
+    def card_heading(self, title, symbol):
+        widget = QWidget()
+        row = QHBoxLayout(widget)
+        row.setContentsMargins(0, 0, 0, 6)
+        row.setSpacing(10)
+        picture = QLabel()
+        picture.setPixmap(QIcon(str(Path(__file__).parent/'assets'/f'ui-{symbol}.svg')).pixmap(25, 25))
+        row.addWidget(picture)
+        label = QLabel(title)
+        label.setObjectName('cardTitle')
+        row.addWidget(label, 1)
+        return widget
+
     def build_capture(self):
         page = QWidget()
+        page.setObjectName('capturePage')
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        layout.setContentsMargins(0, 0, 10, 6)
         layout.setSpacing(16)
         row = QHBoxLayout()
         self.category = QLabel('Saving to  /  Desktop')
@@ -193,8 +231,10 @@ class Window(QMainWindow):
         layout.addLayout(row)
         cards = QHBoxLayout()
         cards.setSpacing(16)
-        replay = QGroupBox('Instant replay')
+        replay = QGroupBox()
+        replay.setObjectName('captureCard')
         body = QVBoxLayout(replay)
+        body.addWidget(self.card_heading('Instant replay', 'replay'))
         self.replay_metric = QLabel(f"{self.settings['replay_seconds']} sec")
         self.replay_metric.setObjectName('metric')
         body.addWidget(self.replay_metric)
@@ -210,8 +250,10 @@ class Window(QMainWindow):
         buttons.addWidget(self.save_btn)
         body.addLayout(buttons)
         cards.addWidget(replay, 1)
-        recording = QGroupBox('Recording')
+        recording = QGroupBox()
+        recording.setObjectName('captureCard')
         body = QVBoxLayout(recording)
+        body.addWidget(self.card_heading('Recording', 'record'))
         self.record_metric = QLabel('00:00:00')
         self.record_metric.setObjectName('metric')
         body.addWidget(self.record_metric)
@@ -227,16 +269,26 @@ class Window(QMainWindow):
             button.setEnabled(False)
         self.shortcut_label = QLabel()
         self.shortcut_label.setObjectName('muted')
+        self.shortcut_label.setWordWrap(True)
         layout.addWidget(self.shortcut_label)
         self.update_shortcut_label()
+        self.performance = QLabel('Capture statistics appear while the engine is running.')
+        self.performance.setObjectName('muted')
+        self.performance.setWordWrap(True)
+        layout.addWidget(self.performance)
         lower = QHBoxLayout()
         lower.setSpacing(16)
-        audio = QGroupBox('Audio')
+        audio = QGroupBox()
+        audio.setObjectName('captureCard')
         form = QFormLayout(audio)
+        form.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         form.setVerticalSpacing(16)
         form.setHorizontalSpacing(24)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.addRow(self.card_heading('Audio', 'audio'))
         self.mode = QComboBox()
+        self.mode.setMinimumHeight(40)
+        self.mode.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.mode.addItems(['Always on', 'Push to talk', 'Muted'])
         self.mode.setCurrentText(self.settings['mic_mode'])
         form.addRow('Microphone', self.mode)
@@ -261,8 +313,10 @@ class Window(QMainWindow):
         self.mic_label.setWordWrap(True)
         form.addRow(self.mic_label)
         lower.addWidget(audio, 1)
-        activity = QGroupBox('Recent activity')
+        activity = QGroupBox()
+        activity.setObjectName('captureCard')
         activity_layout = QVBoxLayout(activity)
+        activity_layout.addWidget(self.card_heading('Recent activity', 'activity'))
         self.messages = QPlainTextEdit()
         self.messages.setReadOnly(True)
         self.messages.setMaximumBlockCount(250)
@@ -272,7 +326,11 @@ class Window(QMainWindow):
         lower.addWidget(activity, 1)
         layout.addLayout(lower)
         layout.addStretch(1)
-        self.tabs.addTab(page, 'Capture')
+        self.capture_scroll = QScrollArea()
+        self.capture_scroll.setWidgetResizable(True)
+        self.capture_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.capture_scroll.setWidget(page)
+        self.tabs.addTab(self.capture_scroll, 'Capture')
 
     def spin(self, low, high, value, suffix=""):
         control = QSpinBox()
@@ -314,6 +372,10 @@ class Window(QMainWindow):
         output_row.addWidget(self.output)
         output_row.addWidget(self.button('Browse', self.choose_output))
         form.addRow('Save clips to', output_row)
+        self.storage_limit = self.spin(0, 1000000, self.settings.get('storage_limit_gb', 0), ' GB')
+        self.storage_limit.setSpecialValueText('Unlimited')
+        self.storage_limit.setToolTip('Advisory limit only. Recording continues and clips are never automatically deleted.')
+        form.addRow('Library limit (warning only)', self.storage_limit)
         self.seconds = self.spin(5, 1800, self.settings['replay_seconds'], ' sec')
         form.addRow('Replay duration', self.seconds)
         self.replay_mode = QComboBox()
@@ -338,6 +400,17 @@ class Window(QMainWindow):
         self.encoder.addItems(ENCODERS)
         self.encoder.setCurrentText(self.settings['encoder'])
         form.addRow('Encoder', self.encoder)
+        self.nvenc_preset = QComboBox()
+        for label, value in [('Fastest · P1', 'p1'), ('Efficient · P3', 'p3'), ('Balanced · P4', 'p4'), ('Quality · P5', 'p5')]:
+            self.nvenc_preset.addItem(label, value)
+        self.nvenc_preset.setCurrentIndex(self.nvenc_preset.findData(self.settings.get('nvenc_preset', 'p4')))
+        self.nvenc_preset.setEnabled(self.encoder.currentText().startswith('NVIDIA'))
+        self.encoder.currentTextChanged.connect(lambda value: self.nvenc_preset.setEnabled(value.startswith('NVIDIA')))
+        form.addRow('NVIDIA effort', self.nvenc_preset)
+        effort_note = QLabel('Lower presets reduce encoder work at a quality cost. Resolution and frame rate also affect load. Replay and recording share one encoder.')
+        effort_note.setWordWrap(True)
+        effort_note.setObjectName('muted')
+        form.addRow(effort_note)
         resolution = QHBoxLayout()
         self.width = self.spin(64, 4096, self.settings['width'])
         self.height = self.spin(64, 4096, self.settings['height'])
@@ -362,6 +435,11 @@ class Window(QMainWindow):
         form.addRow('Microphone', self.mic)
         form.addRow('Desktop output', self.output_device)
         form.addRow(self.button('Refresh devices', lambda: self.submit('refresh_devices')))
+        form.addRow(self.button('Apply / reconnect audio', self.apply_audio, 'quiet'))
+        audio_note = QLabel('Audio changes apply while capturing. System default follows Windows; a named device stays pinned. Playback follows the Windows output. Switching can leave a brief audio gap.')
+        audio_note.setWordWrap(True)
+        audio_note.setObjectName('muted')
+        form.addRow(audio_note)
         form = section('Shortcuts', 'KEYBOARD SHORTCUTS', 'Click a field and press your key or combination. Esc cancels. Apply settings to save.')
         self.replay_key = ShortcutField(self.settings['replay_key'])
         self.record_key = ShortcutField(self.settings['record_key'])
@@ -392,8 +470,42 @@ class Window(QMainWindow):
         note.setWordWrap(True)
         note.setObjectName('muted')
         form.addRow(note)
+
+        form = section('Appearance', 'APPEARANCE', 'Your choices save automatically. Tint and refreshing glass update live. Switching the window frame between Classic and Glass requires a restart.')
+        self.ui_theme = QComboBox()
+        self.ui_theme.addItem('Classic dark', 'dark')
+        self.ui_theme.addItem('Frosted glass', 'glass')
+        self.ui_theme.setCurrentIndex(max(0, self.ui_theme.findData(self.current_theme)))
+        self.ui_theme.currentIndexChanged.connect(self.preview_appearance)
+        form.addRow('Theme', self.ui_theme)
+        glass_note = QLabel('Glass reveals windows behind ClipNest with a dark tint and native blur. Windows Transparency effects must be enabled. Drag the title bar to move, double-click to maximize, or drag any edge/corner to resize. Classic restores the standard title bar after restart. If needed, launch with --safe-ui.')
+        glass_note.setWordWrap(True)
+        glass_note.setObjectName('muted')
+        form.addRow(glass_note)
+        self.tint_slider = QSlider(Qt.Orientation.Horizontal)
+        self.tint_slider.setRange(25, 85)
+        self.tint_slider.setValue(self._glass_tint)
+        self.tint_label = QLabel(f'{self._glass_tint}%')
+        tint_row = QHBoxLayout()
+        tint_row.addWidget(self.tint_slider, 1)
+        tint_row.addWidget(self.tint_label)
+        self.tint_slider.valueChanged.connect(self.preview_tint)
+        form.addRow('Glass tint', tint_row)
+        self.glass_status = QLabel(str(self.property('backdropMode') or 'Glass starts after saving and restarting.'))
+        self.glass_status.setWordWrap(True)
+        self.glass_status.setObjectName('muted')
+        self.backdropChanged.connect(self.glass_status.setText)
+        form.addRow('Current effect', self.glass_status)
+        self.appearance_saved = QLabel('Appearance changes save automatically.')
+        self.appearance_saved.setWordWrap(True)
+        self.appearance_saved.setObjectName('muted')
+        form.addRow(self.appearance_saved)
+        form.addRow(self.button('Open Windows transparency settings', lambda: QDesktopServices.openUrl(QUrl('ms-settings:colors')), 'quiet'))
+        form.addRow(self.button('Refresh glass effect', self.refresh_backdrop, 'quiet'))
+        form.addRow(self.button('Open running ClipNest folder', lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1]))), 'quiet'))
+
         row = QHBoxLayout()
-        note = QLabel('Stop replay and recording before applying settings.')
+        note = QLabel('Stop replay and recording before applying capture settings. Appearance can be changed separately without restarting the recorder.')
         note.setObjectName('muted')
         row.addWidget(note, 1)
         row.addWidget(self.button('Apply settings', self.apply_settings, 'primary'))
@@ -440,6 +552,41 @@ class Window(QMainWindow):
             self.watch_clips(clips, index)
         browser.deleteLater()
 
+    def preview_appearance(self, *_):
+        if not hasattr(self, "ui_theme"):
+            return
+        self.current_theme = apply_theme(self, self.ui_theme.currentData() or "dark")
+        # Keep any already-open secondary windows visually in sync with the preview.
+        if self.editor is not None:
+            apply_theme(self.editor, self.current_theme, '\nQPushButton { padding: 6px 9px; }')
+        if self.quick_player is not None:
+            apply_theme(self.quick_player, self.current_theme)
+        self.save_appearance()
+
+    def preview_tint(self, value, save=True):
+        self.set_glass_tint(value)
+        self.tint_label.setText(f'{value}%')
+        for window in (getattr(self, 'editor', None), getattr(self, 'quick_player', None)):
+            if window is not None:
+                window.set_glass_tint(value)
+        if save and hasattr(self, 'appearance_saved'):
+            self.save_appearance()
+
+    def save_appearance(self):
+        theme = normalize_theme(self.ui_theme.currentData())
+        tint = self.tint_slider.value()
+        try:
+            if not self.preview:
+                persist_appearance(theme, tint)
+        except (OSError, ValueError) as exc:
+            self.appearance_saved.setText(f'Appearance could not be saved: {exc}')
+            logging.exception('Appearance save failed')
+            return
+        self.settings.update(ui_theme=theme, glass_tint=tint)
+        restart = theme != self._surface_theme
+        self.appearance_saved.setText(('Preview only.' if self.preview else 'Saved.') +
+            (' Restart ClipNest to change the window frame.' if restart else ' Tint and glass refresh update live.'))
+
     def notification_options(self):
         return dict(notifications_enabled=self.notification_enabled.isChecked(),
                     notification_corner=self.notification_corner.currentText(),
@@ -463,9 +610,7 @@ class Window(QMainWindow):
             from .editor import Editor
             self.editor = Editor(self)
         self.editor.clips_folder = Path(self.settings["output"])
-        self.editor.showNormal()
-        self.editor.raise_()
-        self.editor.activateWindow()
+        show_centered(self.editor, self)
         if isinstance(path, str):
             self.editor.open_clip(path)
 
@@ -496,6 +641,8 @@ class Window(QMainWindow):
             self.settings.update(mic_mode=mode, mic_volume=volume)
 
     def update_state(self, data):
+        if self.closing:
+            return
         if data["connected"] and not self.connected:
             self.last_mic = None
         self.connected = data["connected"]
@@ -516,6 +663,9 @@ class Window(QMainWindow):
             self.record_btn.style().polish(self.record_btn)
             self.save_btn.setEnabled(False)
             return
+        stats = data.get('stats', {})
+        if stats:
+            self.performance.setText(f"{stats.get('fps', 0):.1f} fps · Render {stats.get('render_ms', 0):.2f} ms · Render lag {stats.get('lagged', 0)} / {stats.get('total', 0)} frames · Shared video encoder")
         self.recording, self.replay = data["recording"], data["replay"]
         self.last_app = data["app"]
         self.category.setText(f"Saving to  /  {self.last_app['category']}")
@@ -525,9 +675,10 @@ class Window(QMainWindow):
         self.record_metric.setText(data["timecode"] if self.recording else "00:00:00")
         self.record_hint.setText("Recording in progress" if self.recording else "Capture from start to finish")
         self.replay_metric.setText(f"{data['replay_seconds']} sec")
-        self.record_btn.setProperty("active", self.recording)
-        self.record_btn.style().unpolish(self.record_btn)
-        self.record_btn.style().polish(self.record_btn)
+        if self.record_btn.property("active") != self.recording:
+            self.record_btn.setProperty("active", self.recording)
+            self.record_btn.style().unpolish(self.record_btn)
+            self.record_btn.style().polish(self.record_btn)
         recording = f"Recording {data['timecode']}" if self.recording else "Manual recording off"
         capture = {0: "Automatic capture", 1: "DXGI capture", 2: "Windows Graphics Capture"}.get(data.get("capture_method"), "Screen capture") if data.get("capture_attached") else "Screen capture idle"
         self.status.setText(f"{'Replay ON' if self.replay else 'Replay off'}  •  {recording}  •  {capture}")
@@ -548,6 +699,9 @@ class Window(QMainWindow):
             index = control.findData(selected)
             if index >= 0:
                 control.setCurrentIndex(index)
+            elif selected is not None:
+                control.addItem('Unavailable saved device', selected)
+                control.setCurrentIndex(control.count()-1)
 
     def update_meters(self, levels):
         for name, meter in [(MIC, self.mic_meter), (DESKTOP, self.desktop_meter)]:
@@ -556,9 +710,14 @@ class Window(QMainWindow):
 
     def log(self, text):
         self.messages.appendPlainText(text)
+        if self.closing:
+            self.status.setText(text)
 
     def show_error(self, text):
         self.log("ERROR: " + text)
+        if self.closing:
+            self.status.setText("Still closing the recorder • See the message below")
+            return
         self.connect_btn.setEnabled(not self.connected)
         self.status.setText("Action failed • See the message below")
         # Output-stop events already have a specific error notification.
@@ -595,8 +754,15 @@ class Window(QMainWindow):
         self.capturing_shortcut = active
         if active:
             self.hotkeys.close()
+            if self.system_events is not None:
+                self.system_events.close()
+            QApplication.instance().removeNativeEventFilter(self.native_filter)
         elif not self.preview:
             self.register_hotkeys()
+
+    def apply_audio(self):
+        self.submit('apply_audio', dict(mic_device=self.mic.currentData() or self.settings['mic_device'],
+                                       desktop_device=self.output_device.currentData() or self.settings['desktop_device']))
 
     def apply_settings(self):
         try:
@@ -610,12 +776,13 @@ class Window(QMainWindow):
             if len(set(parsed)) != 3:
                 raise ValueError("Use different keys for replay, recording, and push to talk.")
             data = copy.deepcopy(self.settings)
-            data.update(output=self.output.text().strip(), replay_seconds=self.seconds.value(), replay_mode=self.replay_mode.currentData(),
-                        encoder=self.encoder.currentText(), capture_method=self.capture_method.currentData(), width=self.width.value(), height=self.height.value(),
+            data.update(output=self.output.text().strip(), storage_limit_gb=self.storage_limit.value(), replay_seconds=self.seconds.value(), replay_mode=self.replay_mode.currentData(),
+                        encoder=self.encoder.currentText(), nvenc_preset=self.nvenc_preset.currentData(), capture_method=self.capture_method.currentData(), width=self.width.value(), height=self.height.value(),
                         fps=int(self.fps.currentText()), bitrate=self.bitrate.value(),
                         mic_device=self.mic.currentData() or self.settings["mic_device"],
                         desktop_device=self.output_device.currentData() or self.settings["desktop_device"],
-                        replay_key=replay_key, record_key=record_key, ptt_key=ptt_key)
+                        replay_key=replay_key, record_key=record_key, ptt_key=ptt_key,
+                        ui_theme=self.ui_theme.currentData() or self.current_theme, glass_tint=self.tint_slider.value())
             data.update(self.notification_options())
             if self.monitor.currentData() is not None:
                 data.update(monitor_value=self.monitor.currentData(), monitor_property=self.device_data.get("monitor_property", "monitor_id"))
@@ -624,8 +791,28 @@ class Window(QMainWindow):
             self.show_error(str(exc))
 
     def settings_applied(self, data):
+        data = dict(data, ui_theme=self.settings.get('ui_theme', self.current_theme),
+                    glass_tint=self.settings.get('glass_tint', self._glass_tint))
         self.settings = copy.deepcopy(data)
+        self.tint_slider.blockSignals(True)
+        self.tint_slider.setValue(self.settings.get('glass_tint', 46))
+        self.tint_slider.blockSignals(False)
+        self.preview_tint(self.tint_slider.value(), save=False)
+        self.current_theme = normalize_theme(self.settings.get('ui_theme', 'dark'))
+        apply_theme(self, self.current_theme)
+        if hasattr(self, 'ui_theme'):
+            index = self.ui_theme.findData(self.current_theme)
+            if index >= 0 and self.ui_theme.currentIndex() != index:
+                self.ui_theme.blockSignals(True)
+                self.ui_theme.setCurrentIndex(index)
+                self.ui_theme.blockSignals(False)
+        if self.editor is not None:
+            apply_theme(self.editor, self.current_theme, '\nQPushButton { padding: 6px 9px; }')
+        if self.quick_player is not None:
+            apply_theme(self.quick_player, self.current_theme)
         self.notifications.settings = self.settings
+        self.gallery.storage.root = Path(data["output"])
+        self.gallery.storage.quota = data.get("storage_limit_gb", 0)
         self.gallery.root = Path(data["output"])
         self.gallery.refresh()
         if self.editor is not None:
@@ -668,7 +855,21 @@ class Window(QMainWindow):
         else:
             self.showMinimized()
 
+    def close_join_jobs(self):
+        from .join_dialog import JoinDialog
+        busy = False
+        for dialog in self.findChildren(JoinDialog):
+            if dialog.job is not None:
+                dialog.job.cancel.set()
+                dialog.status.setText('Cancelling before ClipNest closes…')
+                busy = True
+        return not busy
+
     def closeEvent(self, event):
+        if not self.close_join_jobs():
+            event.ignore()
+            QTimer.singleShot(200, self.close)
+            return
         if self.editor is not None and not self.editor.can_close():
             event.ignore()
             return
@@ -679,16 +880,24 @@ class Window(QMainWindow):
             if self.quick_player is not None:
                 self.quick_player.close()
             self.hotkeys.close()
+            if self.system_events is not None:
+                self.system_events.close()
+            QApplication.instance().removeNativeEventFilter(self.native_filter)
             self.notifications.close()
             event.accept()
             return
         event.ignore()
         if not self.closing:
             self.closing = True
+            for button in (self.connect_btn, self.replay_btn, self.record_btn, self.save_btn):
+                button.setEnabled(False)
             self.status.setText("Finishing recordings and closing the recorder...")
             self.engine.submit("shutdown")
 
     def shutdown_complete(self, success):
+        if success and not self.close_join_jobs():
+            QTimer.singleShot(200, lambda: self.shutdown_complete(True))
+            return
         if success:
             self.engine.wait(3000)
             self.allow_close = True
@@ -696,5 +905,5 @@ class Window(QMainWindow):
             self.close()
             QApplication.instance().quit()
         else:
-            self.closing = False
-            self.show_normal()
+            self.status.setText("Still closing the recorder...")
+            self.engine.submit("shutdown")

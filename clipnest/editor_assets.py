@@ -52,16 +52,16 @@ def waveform(info, index, ffmpeg, cancel, bins=1600):
 def thumbnail(path, ffmpeg, cache, cancel):
     path = Path(path)
     stat = path.stat()
-    key = hashlib.sha256(f'{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
+    key = hashlib.sha256(f'fullhd-v2:{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}'.encode()).hexdigest()
     cache.mkdir(parents=True, exist_ok=True)
     target = cache/(key+'.jpg')
     if target.exists():
         return str(target)
     with tempfile.TemporaryFile() as data:
         captured_file([ffmpeg, '-v', 'error', '-nostdin', '-i', str(path), '-frames:v', '1',
-            '-vf', 'scale=240:-2', '-an', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'], data, cancel, 10)
+            '-vf', "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease", '-q:v', '2', '-an', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-'], data, cancel, 10)
         data.seek(0)
-        image = data.read(1024*1024)
+        image = data.read()
     if image:
         # No partial thumbnails are visible to another browser instance.
         with tempfile.NamedTemporaryFile(dir=cache, suffix='.tmp', delete=False) as temp:
@@ -76,7 +76,8 @@ def scan_clips(root, cancel, limit=10000):
     clips = []
     errors = []
     for directory, folders, files in os.walk(root, onerror=lambda exc: errors.append(str(exc))):
-        folders[:] = [f for f in folders if not f.startswith('.') and f != '_ReplayCache']
+        from .library import linked
+        folders[:] = [f for f in folders if not f.startswith('.') and f not in ('_ReplayCache', '_Unsorted') and not linked(Path(directory)/f)]
         for filename in files:
             if cancel.is_set():
                 return [], False, errors

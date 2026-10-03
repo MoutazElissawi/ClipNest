@@ -23,7 +23,9 @@ class NativeEngine:
         self.scene = None
         self.inputs, self.items, self.outputs = {}, {}, {}
         self.encoders, self.callbacks, self.meters = [], [], []
+        self.source_meters = {}
         self.stop_events, self.stop_codes = {}, {}
+        self.stopping = set()
         self.record_path = self.last_replay = ""
         self.record_start = 0
         self.settings = {}
@@ -52,7 +54,8 @@ class NativeEngine:
         config_dir = DATA / "native-config"
         config_dir.mkdir(parents=True, exist_ok=True)
         self.lib = l = LibObs(ENGINE)
-        print(f"ClipNest 0.2.2 host: {sys.executable}; encoder: {settings['encoder']}", file=sys.stderr, flush=True)
+        from . import __version__
+        print(f"ClipNest {__version__} host: {sys.executable}; encoder: {settings['encoder']}", file=sys.stderr, flush=True)
         if not l.obs_startup(b"en-US", obs_path(config_dir), None):
             raise RuntimeError("libobs initialization failed. See native-engine.log.")
         self.started = True
@@ -127,11 +130,17 @@ class NativeEngine:
         available = l.enumerate(l.obs_enum_encoder_types)
         if encoder_id not in available:
             raise RuntimeError(f"{s['encoder']} is unavailable. Stop replay and select another encoder in Settings.")
-        with l.data({"rate_control": "CBR", "bitrate": s["bitrate"], "keyint_sec": 2,
-                     "preset": "veryfast" if s["encoder"].startswith("CPU") else "p4",
-                     "preset2": "p4", "tune": "hq", "multipass": "disabled", "bf": 2,
-                     "profile": "main" if s["encoder"] == "NVIDIA AV1" else "high",
-                     "lookahead": False, "psycho_aq": False}) as data:
+        video_settings = {"rate_control": "CBR", "bitrate": s["bitrate"], "keyint_sec": 2,
+                          "profile": "main" if s["encoder"] == "NVIDIA AV1" else "high"}
+        if s['encoder'].startswith('CPU'):
+            video_settings['preset'] = 'veryfast'
+        else:
+            # OBS 32.2.2 obs-nvenc uses adaptive_quantization, not legacy psycho_aq.
+            video_settings.update(preset=s.get('nvenc_preset', 'p4'), tune='hq',
+                                  multipass='disabled', bf=2, lookahead=False,
+                                  adaptive_quantization=False)
+        print(f'Video encoder settings: {video_settings}; one shared video encoder for replay + recording', file=sys.stderr, flush=True)
+        with l.data(video_settings) as data:
             video = l.obs_video_encoder_create(utf8(encoder_id), b"ClipNest Video", data, None)
         if not video: raise RuntimeError("Video encoder creation failed.")
         self.encoders.append(video)
@@ -198,14 +207,23 @@ class NativeEngine:
         self.callbacks.append((handler, b"saved", callback))
 
     def stop(self, kind):
-        if not self.active(kind):
+        if not self.active(kind) and kind not in self.stopping:
             self.release_idle_capture()
             return
         event = self.stop_events[kind]
-        event.clear()
-        self.lib.obs_output_stop(self.outputs[kind])
-        if not event.wait(20):
-            raise RuntimeError(f"{kind.capitalize()} has not finished closing. Check native-engine.log.")
+        # Clear only on the first request. A late completion must survive retries.
+        if kind not in self.stopping:
+            self.stopping.add(kind)
+            event.clear()
+            self.lib.obs_output_stop(self.outputs[kind])
+        if not event.wait(8):
+            self.emit("NativeNotice", {"message": f"{kind.capitalize()} is slow to stop; asking the recorder to finish immediately."})
+            # libobs still finalizes the muxer and emits its completion signal.
+            # This is not process termination; queued tail frames may be omitted.
+            self.lib.obs_output_force_stop(self.outputs[kind])
+            if not event.wait(3):
+                raise RuntimeError(f"{kind.capitalize()} has not finished closing. Check native-engine.log.")
+        self.stopping.discard(kind)
         if kind == "replay" and self.settings.get("replay_mode") == "continuous" and self.segment_path:
             self.emit("ReplaySegmentClosed", {"path": self.segment_path, "next": None, "save": False})
             self.segment_path = ""
@@ -273,11 +291,73 @@ class NativeEngine:
         l.obs_volmeter_add_callback(meter, callback, None)
         l.obs_volmeter_attach_source(meter, source)
         self.meters.append((meter, callback))
+        self.source_meters[name] = meter
+
+    def reconnect_audio(self, sources):
+        """Replace endpoint clients, keeping video and the three encoded tracks alive.
+
+        Updating an unchanged WASAPI device ID does not restart OBS's audio client.
+        Stage muted sources first, so allocation failure leaves old routing intact.
+        """
+        l = self.lib
+        prepared = []
+        try:
+            for spec in sources:
+                name = spec['inputName']
+                old, kind = self.inputs[name]
+                if not kind.startswith('wasapi_'):
+                    raise ValueError('Only WASAPI sources can be reconnected as audio.')
+                with l.data({'device_id': spec['device_id'], 'use_device_timing': False}) as data:
+                    source = l.obs_source_create(utf8(kind), utf8(name+' reconnecting'), data, None)
+                if not source:
+                    raise RuntimeError(f'Could not reconnect {name}. Existing audio routing is unchanged.')
+                l.obs_source_set_muted(source, True)
+                l.obs_source_set_audio_mixers(source, 0)
+                item = l.obs_scene_add(self.scene, source)
+                if not item:
+                    l.obs_source_release(source)
+                    raise RuntimeError(f'Could not attach {name}.')
+                prepared.append((spec, source, item, old, kind))
+        except Exception:
+            for _, source, item, _, _ in prepared:
+                l.obs_sceneitem_remove(item)
+                l.obs_source_release(source)
+            raise
+        for spec, source, item, old, kind in prepared:
+            name = spec['inputName']
+            l.obs_source_set_muted(old, True)
+            l.obs_source_set_audio_mixers(old, 0)
+            l.obs_source_set_volume(source, spec['volume'])
+            l.obs_source_set_monitoring_type(source, 0)
+            if name in self.source_meters:
+                l.obs_volmeter_attach_source(self.source_meters[name], source)
+            else:
+                self.attach_meter(source, name)
+            l.obs_sceneitem_remove(self.items[name])
+            l.obs_source_release(old)
+            l.obs_source_set_name(source, utf8(name))
+            self.inputs[name] = (source, kind)
+            self.items[name] = item
+            l.obs_source_set_audio_mixers(source, spec['mixers'])
+            l.obs_source_set_muted(source, spec['muted'])
+            print(f"Reconnected {name}: {spec['device_id']}", file=sys.stderr, flush=True)
+
+    def capture_stats(self):
+        l = self.lib
+        return dict(fps=round(l.obs_get_active_fps(), 1),
+                    render_ms=round(l.obs_get_average_frame_time_ns()/1e6, 2),
+                    total=l.obs_get_total_frames(), lagged=l.obs_get_lagged_frames(),
+                    outputs={name: dict(frames=l.obs_output_get_total_frames(output),
+                                       dropped=l.obs_output_get_frames_dropped(output))
+                             for name, output in self.outputs.items() if self.active(name)})
 
     def call(self, method, a):
         if method == "Initialize": return self.initialize(a["settings"])
         if not self.started: raise RuntimeError("Native recorder is not initialized.")
         l = self.lib
+        if method == 'ReconnectAudioSources':
+            self.reconnect_audio(a['sources'])
+            return {}
         if method == "GetSceneList": return {"scenes": [{"sceneName": "Capture"}] if self.scene else []}
         if method == "CreateScene":
             self.scene = l.obs_scene_create(b"Capture")
@@ -320,7 +400,8 @@ class NativeEngine:
             hours, rem = divmod(int(elapsed), 3600)
             minutes, seconds = divmod(rem, 60)
             return {"outputActive": self.active("record"), "outputTimecode": f"{hours:02}:{minutes:02}:{seconds:02}",
-                    "captureAttached": self.capture_attached, "captureMethod": self.capture_method}
+                    "captureAttached": self.capture_attached, "captureMethod": self.capture_method,
+                    "stats": self.capture_stats()}
         elif method == "GetReplayBufferStatus": return {"outputActive": self.active("replay")}
         elif method == "StartRecord": self.start("record")
         elif method == "StartReplayBuffer": self.start("replay")
@@ -350,8 +431,14 @@ class NativeEngine:
                 self.com_initialized = False
             return
         l = self.lib
-        self.stop("record")
-        self.stop("replay")
+        errors = []
+        for kind in ("record", "replay"):
+            try:
+                self.stop(kind)
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            raise RuntimeError("; ".join(errors))
         for handler, name, callback in self.callbacks: l.signal_handler_disconnect(handler, name, callback, None)
         for output in self.outputs.values(): l.obs_output_release(output)
         for enc in self.encoders: l.obs_encoder_release(enc)

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import json
 import psutil
+import time
 
 KNOWN_GAMES = {"helldivers2.exe": "Helldivers 2", "rocketleague.exe": "Rocket League",
                "marvel-win64-shipping.exe": "Marvel Rivals", "chivalry2-win64-shipping.exe": "Chivalry 2",
@@ -52,11 +53,45 @@ def foreground():
     hwnd = user.GetForegroundWindow()
     pid = wintypes.DWORD()
     user.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return None
+    result = {"pid": pid.value, "exe": "", "name": ""}
     try:
         process = psutil.Process(pid.value)
-        return {"pid": pid.value, "exe": process.exe(), "name": process.name()}
+        # Elevated/protected games may expose their name but deny the full path.
+        for key, getter in (("name", process.name), ("exe", process.exe)):
+            try:
+                result[key] = getter()
+            except (psutil.Error, OSError):
+                pass
     except (psutil.Error, OSError):
-        return None
+        pass
+    if not result['exe']:
+        result['exe'] = limited_process_path(pid.value)
+    if not result['name'] and result['exe']:
+        result['name'] = result['exe'].replace('\\', '/').rsplit('/', 1)[-1]
+    return result
+
+
+def limited_process_path(pid):
+    """Windows limited-query fallback, without elevating ClipNest."""
+    if os.name != 'nt':
+        return ''
+    kernel = ctypes.windll.kernel32
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return ''
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        return buffer.value if kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)) else ''
+    finally:
+        kernel.CloseHandle(handle)
 
 
 def normalized_path(path):
@@ -67,6 +102,7 @@ class Catalog:
     def __init__(self, custom):
         self.custom = custom
         self.roots = []
+        self.last_seen = 0.0
         self.last = {"category": "Desktop", "exe": "", "name": "Desktop"}
 
     def discover(self):
@@ -101,7 +137,9 @@ class Catalog:
             except (OSError, ValueError):
                 continue
 
-    def classify(self, path):
+    def classify(self, path, name=""):
+        if not path:
+            path = name
         path = normalized_path(path)
         basename = path.replace("\\", "/").rsplit("/", 1)[-1]
         custom = {normalized_path(key): value for key, value in self.custom.items()}
@@ -116,6 +154,17 @@ class Catalog:
 
     def poll(self):
         app = foreground()
-        if app and app["pid"] != os.getpid() and app["name"].lower() != "obs64.exe":
-            self.last = {**app, "category": self.classify(app["exe"])}
-        return self.last
+        now = time.monotonic()
+        # Clicking ClipNest must preserve the last observed external app. Known
+        # game overlays are transient; Explorer/browser focus is genuine Desktop.
+        own = app and app["pid"] == os.getpid()
+        overlay = app and app.get("name", "").casefold() in {
+            "gameoverlayui.exe", "nvidia overlay.exe", "nvsphelper64.exe", "obs64.exe"}
+        if own:
+            return dict(self.last)
+        if app and (app.get("exe") or app.get("name")) and not overlay:
+            self.last = {**app, "category": self.classify(app.get("exe", ""), app.get("name", ""))}
+            self.last_seen = now
+        elif now - self.last_seen > 3:
+            self.last = {"pid": (app or {}).get("pid"), "exe": "", "name": "Desktop", "category": "Desktop"}
+        return dict(self.last)

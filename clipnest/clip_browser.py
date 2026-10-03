@@ -5,8 +5,12 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QLineEdit, QComboBox, QListWidget, QListWidgetItem, QFileDialog)
+    QLineEdit, QComboBox, QListWidget, QListWidgetItem, QFileDialog, QCheckBox, QInputDialog, QMessageBox)
 from .editor_assets import scan_clips, thumbnail
+
+
+from .desktop import SmoothList
+from .library import Annotations, matches
 
 
 class Scan(QThread):
@@ -16,7 +20,12 @@ class Scan(QThread):
         self.root = root
         self.cancel = threading.Event()
     def run(self):
-        self.ready.emit(scan_clips(self.root, self.cancel))
+        result = scan_clips(self.root, self.cancel)
+        try:
+            Annotations().annotate(result[0])
+        except Exception as exc:
+            result[2].append(str(exc))
+        self.ready.emit(result)
 
 
 class Thumbnails(QThread):
@@ -57,13 +66,24 @@ class ClipBrowser(QDialog):
         layout.addLayout(row)
         row = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText('Search clip name or game folder…')
+        self.search.setPlaceholderText('Search game, name, YYYY-MM-DD or tag…')
         row.addWidget(self.search, 1)
         self.sort = QComboBox()
         self.sort.addItems(['Newest first', 'Oldest first', 'Name A–Z', 'Largest first'])
         row.addWidget(self.sort)
         layout.addLayout(row)
-        self.list = QListWidget()
+        controls = QHBoxLayout()
+        self.favorites = QCheckBox('Favorites only')
+        self.favorites.toggled.connect(self.filter_changed)
+        controls.addWidget(self.favorites)
+        for label, action in [('Favorite / unfavorite', self.favorite_selected), ('Tags…', self.tag_selected), ('Combine…', self.combine_selected)]:
+            button = QPushButton(label)
+            button.clicked.connect(action)
+            controls.addWidget(button)
+        layout.addLayout(controls)
+        self.annotations = Annotations()
+        self.list = SmoothList()
+        self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list.setIconSize(QSize(160, 90))
         self.list.setUniformItemSizes(True)
         self.list.itemDoubleClicked.connect(self.open_selected)
@@ -133,27 +153,68 @@ class ClipBrowser(QDialog):
                 self.workers.remove(worker)
                 worker.deleteLater()
         query = self.search.text().casefold()
-        matches = [c for c in self.clips if query in (c['name']+' '+c['folder']).casefold()]
+        filtered = [c for c in self.clips if matches(c, query, self.favorites.isChecked())]
         mode = self.sort.currentIndex()
-        matches.sort(key=lambda c: c['name'].casefold() if mode == 2 else c['size'] if mode == 3 else c['modified'], reverse=mode in (0, 3))
+        filtered.sort(key=lambda c: c['name'].casefold() if mode == 2 else c['size'] if mode == 3 else c['modified'], reverse=mode in (0, 3))
         self.list.clear()
         self.items.clear()
-        for clip in matches[:self.shown]:
-            item = QListWidgetItem(f"{clip['name']}\n{clip['folder']} • {datetime.fromtimestamp(clip['modified']):%Y-%m-%d %H:%M} • {clip['size']/1048576:.1f} MB")
+        for clip in filtered[:self.shown]:
+            item = QListWidgetItem(f"{'★ ' if clip.get('favorite') else ''}{clip['name']}\n{clip['folder']} • {datetime.fromtimestamp(clip['modified']):%Y-%m-%d %H:%M} • {clip['size']/1048576:.1f} MB")
             item.setData(Qt.ItemDataRole.UserRole, clip['path'])
+            item.setToolTip(clip['path'] + '\nTags: ' + ', '.join(clip.get('tags', [])))
             item.setSizeHint(QSize(350, 100))
             self.list.addItem(item)
             self.items[clip['path']] = item
-        self.more.setEnabled(len(matches) > self.shown)
+        self.more.setEnabled(len(filtered) > self.shown)
         extra = ' • scan limited to 10,000 clips' if getattr(self, 'limited', False) else ''
         if getattr(self, 'errors', []):
             extra += ' • some folders could not be read'
-        self.status.setText(f'{min(len(matches), self.shown)} shown / {len(matches)} matching clips{extra}')
+        self.status.setText(f'{min(len(filtered), self.shown)} shown / {len(filtered)} matching clips{extra}')
         if self.ffmpeg:
             worker = Thumbnails(list(self.items), self.ffmpeg, self.cache, self)
             worker.ready.connect(self.thumbnail_ready)
             self.workers.append(worker)
             worker.start()
+
+    def selected_paths(self):
+        return [item.data(Qt.ItemDataRole.UserRole) for item in self.list.selectedItems()]
+
+    def favorite_selected(self):
+        self.edit_annotations(favorite=True)
+
+    def tag_selected(self):
+        self.edit_annotations(favorite=False)
+
+    def edit_annotations(self, favorite):
+        paths = self.selected_paths()
+        selected = [c for c in self.clips if c['path'] in paths]
+        if not selected:
+            return
+        if favorite:
+            values = dict(favorite=not all(c.get('favorite', False) for c in selected))
+        else:
+            text, ok = QInputDialog.getText(self, 'Tags', 'Comma-separated tags (replaces selected tags):', text=', '.join(selected[0].get('tags', [])))
+            if not ok:
+                return
+            values = dict(tags=[t.strip() for t in text.split(',') if t.strip()])
+        try:
+            for clip in selected:
+                self.annotations.set(clip['path'], **values)
+                clip.update(values)
+            self.populate()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Clip annotations', str(exc))
+
+    def combine_selected(self):
+        from .join_dialog import JoinDialog
+        paths = self.selected_paths()
+        if len(paths) < 2:
+            QMessageBox.information(self, 'Combine clips', 'Ctrl-click two or more clips first.')
+            return
+        dialog = JoinDialog(paths, self)
+        dialog.exec()
+        dialog.deleteLater()
+        self.scan()
 
     def thumbnail_ready(self, path, image):
         if path in self.items:

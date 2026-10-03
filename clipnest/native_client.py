@@ -1,5 +1,6 @@
 """Request/reply transport to our own libobs process over anonymous pipes."""
 import json
+import logging
 import os
 from pathlib import Path
 import queue
@@ -18,7 +19,9 @@ def host_command(env):
     # OBS resolves its helper EXEs beside GetModuleFileNameW(NULL), not cwd/PATH.
     # Use the real base interpreter, not the venv redirector, in our private runtime.
     base = Path(sys.base_prefix)
-    binary = base / "python.exe"
+    binary = base / "ClipNestRecorder.exe"
+    if not binary.is_file():
+        binary = base / "python.exe"
     target = ENGINE / "bin/64bit"
     if not binary.is_file():
         raise RuntimeError(f"Cannot locate the base Python interpreter: {binary}")
@@ -42,6 +45,11 @@ class NativeClient:
         self.event_callback = event_callback
         self.messages = queue.Queue()
         self.closed = False
+        self.shutdown_deadline = None
+        self.shutdown_timer = None
+        self.forced = False
+        self._shutdown_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
         DATA.mkdir(parents=True, exist_ok=True)
         log_path = DATA / "native-engine.log"
         if log_path.exists() and log_path.stat().st_size > 5_000_000:
@@ -85,8 +93,10 @@ class NativeClient:
         ident = uuid.uuid4().hex
         self.process.stdin.write(json.dumps({"id": ident, "method": method, "args": args}) + "\n")
         self.process.stdin.flush()
-        deadline = time.monotonic() + (45 if method in ("Initialize", "Shutdown") else 30)
+        deadline = time.monotonic() + (75 if method == "Shutdown" else 45 if method == "Initialize" else 30)
         while time.monotonic() < deadline:
+            if self.shutdown_deadline is not None and time.monotonic() >= self.shutdown_deadline:
+                raise TimeoutError(f'Native recorder shutdown deadline reached during {method}.')
             try: msg = self.messages.get(timeout=min(.2, max(.01, deadline - time.monotonic())))
             except queue.Empty: continue
             if msg.get("id") == ident:
@@ -100,22 +110,65 @@ class NativeClient:
             try: self.dispatch(self.messages.get_nowait())
             except queue.Empty: return
 
+    def begin_shutdown(self, timeout=20):
+        """Arm once, even while the controller is blocked in an earlier call.
+
+        Only our Popen child can be terminated. A retry never extends its grace
+        period, and the timer never dispatches events or touches Qt objects.
+        """
+        with self._shutdown_lock:
+            if self.shutdown_deadline is not None:
+                return
+            self.shutdown_deadline = time.monotonic() + timeout
+            self.shutdown_timer = threading.Timer(timeout, self.force_stop)
+            self.shutdown_timer.daemon = True
+            self.shutdown_timer.start()
+
+    def force_stop(self):
+        with self._stop_lock:
+            if self.process.poll() is not None:
+                return
+            self.forced = True
+            logging.error('Native recorder did not finish in time; terminating owned child PID %s. Staging files are retained.', self.process.pid)
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait(timeout=2)
+            except ProcessLookupError:
+                pass
+
     def disconnect(self):
-        if self.closed: return
         self.closed = True
-        if self.process.stdin:
+        if self.process.stdin and not self.process.stdin.closed:
             try: self.process.stdin.close()
             except (BrokenPipeError, OSError): pass
-        try: self.process.wait(timeout=25)
+        remaining = 25 if self.shutdown_deadline is None else max(.01, self.shutdown_deadline-time.monotonic())
+        try: self.process.wait(timeout=remaining)
         except subprocess.TimeoutExpired:
-            raise NativeError("Native recorder is still finishing. Restart ClipNest only after its background process exits; do not delete _Unsorted files.")
+            self.force_stop()
         finally:
             if self.process.poll() is not None:
+                if self.shutdown_timer is not None:
+                    self.shutdown_timer.cancel()
                 self.reader.join(timeout=2)
+                # EOF cleanup can emit final recording/replay paths after the
+                # Shutdown reply was lost. Deliver these before archiving ends.
+                while True:
+                    try:
+                        message = self.messages.get_nowait()
+                    except queue.Empty:
+                        break
+                    if "event" in message:
+                        self.dispatch(message)
                 self.log.close()
 
     def close(self):
-        if self.closed: return
+        self.begin_shutdown()
+        if self.closed:
+            self.disconnect()
+            return
         try:
             if self.process.poll() is None:
                 self.call("Shutdown")

@@ -31,11 +31,19 @@ def tools_path(folder=''):
     raise ValueError('Choose a folder containing both ffmpeg.exe and ffprobe.exe using File → FFmpeg folder. Recording does not require these editor tools.')
 
 
-def probe(path, ffprobe):
-    result = run([ffprobe, '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)], timeout=30)
-    if result.returncode:
-        raise ValueError(result.stderr[-2000:] or 'Cannot inspect this clip.')
-    info = json.loads(result.stdout)
+def probe(path, ffprobe, cancel=None):
+    args = [ffprobe, '-v', 'error', '-show_streams', '-show_data', '-show_format', '-of', 'json', str(path)]
+    if cancel is None:
+        result = run(args, timeout=30)
+        if result.returncode:
+            raise ValueError(result.stderr[-2000:] or 'Cannot inspect this clip.')
+        info = json.loads(result.stdout)
+    else:
+        from .editor_assets import captured_file
+        with tempfile.TemporaryFile() as data:
+            captured_file(args, data, cancel, 30)
+            data.seek(0)
+            info = json.load(data)
     video = next((s for s in info.get('streams', []) if s['codec_type'] == 'video' and not s.get('disposition', {}).get('attached_pic')), None)
     if not video:
         raise ValueError('This file has no video stream.')
@@ -46,18 +54,29 @@ def probe(path, ffprobe):
                 audio=[s for s in info['streams'] if s['codec_type'] == 'audio'])
 
 
-def available_encoders(ffmpeg):
+def available_encoders(ffmpeg, cancel=None):
     """Actually encode two frames: listing an encoder does not prove GPU support."""
     available, failures = [], {}
     for label, encoder in ENCODERS.items():
         try:
-            result = run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=s=1280x720:r=30',
-                          '-frames:v', '2', '-c:v', encoder, '-pix_fmt', 'yuv420p', '-f', 'null', '-'], timeout=20)
+            args = [ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=s=1280x720:r=30',
+                    '-frames:v', '2', '-c:v', encoder, '-pix_fmt', 'yuv420p', '-f', 'null', '-']
+            if cancel is not None:
+                if cancel.is_set():
+                    raise ValueError('Encoder inspection cancelled.')
+                from .editor_assets import captured_file
+                with tempfile.TemporaryFile() as output:
+                    captured_file(args, output, cancel, 20)
+                available.append(label)
+                continue
+            result = run(args, timeout=20)
             if result.returncode == 0:
                 available.append(label)
             else:
                 failures[label] = result.stderr[-1200:]
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+            if cancel is not None and cancel.is_set():
+                raise ValueError('Encoder inspection cancelled.') from exc
             failures[label] = str(exc)
     return available, failures
 
@@ -75,6 +94,8 @@ class Edit:
     contrast: float = 1.0
     saturation: float = 1.0
     remix: bool = False
+    resolution: tuple | None = None
+    fps: int = 0
 
 
 def export_args(info, edit, ffmpeg, destination):
@@ -94,6 +115,15 @@ def export_args(info, edit, ffmpeg, destination):
         filters.append(f'crop={w}:{h}:{x}:{y}')
     if not (-1 <= edit.brightness <= 1 and 0 <= edit.contrast <= 2 and 0 <= edit.saturation <= 2):
         raise ValueError('Invalid color filter values.')
+    if edit.resolution:
+        if len(edit.resolution) != 2 or any(type(v) is not int or v < 2 or v > 4096 or v % 2 for v in edit.resolution):
+            raise ValueError('Export resolution must use even dimensions from 2 to 4096.')
+        w, h = edit.resolution
+        filters += [f'scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2', f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2']
+    if edit.fps not in (0, 24, 30, 60):
+        raise ValueError('Choose source FPS, 24, 30 or 60.')
+    if edit.fps:
+        filters.append(f'fps={edit.fps}')
     filters += [f'eq=brightness={edit.brightness}:contrast={edit.contrast}:saturation={edit.saturation}', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', 'format=yuv420p']
     args = [ffmpeg, '-hide_banner', '-v', 'error', '-nostdin', '-n', '-ss', f'{edit.start:.6f}', '-i', info['path'],
             '-t', f'{edit.end-edit.start:.6f}', '-map', f"0:{info['video']['index']}", '-vf', ','.join(filters),
@@ -196,3 +226,32 @@ def export_clip(info, edit, ffmpeg, target, cancel=None, progress=None, *, overw
                 reader.join(timeout=3)
                 process.stdout.close()
     return str(target)
+
+
+def estimated_size(edit):
+    tracks = 1 if edit.remix and edit.audio else len(edit.audio)
+    return max(0, edit.end-edit.start) * (edit.bitrate + 192*tracks) * 1000/8
+
+
+class ExportETA:
+    """Smoothed throughput from FFmpeg's encoded media progress."""
+    def __init__(self):
+        import time
+        self.clock = time.monotonic
+        self.reset()
+
+    def reset(self):
+        self.started = self.previous = self.clock()
+        self.percent = 0
+        self.rate = None
+
+    def update(self, percent):
+        now = self.clock()
+        elapsed = now-self.previous
+        if percent > self.percent and elapsed > 0:
+            rate = (percent-self.percent)/elapsed
+            self.rate = rate if self.rate is None else .25*rate + .75*self.rate
+            self.percent, self.previous = percent, now
+        if now-self.started < 2 or not self.rate or percent <= 0:
+            return None
+        return max(0, (100-percent)/self.rate)

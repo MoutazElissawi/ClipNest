@@ -12,10 +12,10 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QSlider, QDoubleSpinBox, QComboBox, QTableWidget,
     QTableWidgetItem, QCheckBox, QProgressBar, QDialog, QFormLayout, QSpinBox,
-    QDialogButtonBox, QScrollArea, QSplitter, QInputDialog)
+    QDialogButtonBox, QScrollArea, QSplitter, QInputDialog, QLayout, QSizePolicy)
 
 from .config import DATA, atomic_json
-from .media import tools_path, probe, available_encoders, Edit, export_clip, ENCODERS
+from .media import tools_path, probe, available_encoders, Edit, export_clip, ENCODERS, estimated_size, ExportETA
 from .preview import VideoCanvas, Waveform
 from .editor_assets import waveform
 
@@ -37,13 +37,19 @@ class Job(QThread):
             self.failed.emit(str(exc))
 
 
-class Editor(QMainWindow):
+from .desktop import DefaultAudioOutput, show_centered, ItemDelegate
+from .window_frame import DesktopWindow
+
+
+class Editor(DesktopWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('ClipNest • Clip editor')
-        from .theme import STYLE
-        self.setStyleSheet(STYLE + '\nQPushButton { padding: 6px 9px; }')
-        self.resize(1360, 760)
+        from .theme import apply_theme
+        theme = getattr(parent, 'current_theme', parent.settings.get('ui_theme', 'dark')) if parent is not None and hasattr(parent, 'settings') else 'dark'
+        apply_theme(self, theme, '\nQPushButton { padding: 6px 9px; }')
+        self.resize(1400, 900)
+        self.setMinimumSize(1000, 600)
         self.clips_folder = Path(parent.settings["output"]) if parent is not None and hasattr(parent, "settings") else Path.home()/"Videos/ClipNest"
         self.encoder_errors = {}
         self.last_export_path = None
@@ -64,15 +70,20 @@ class Editor(QMainWindow):
         raw_presets = self.prefs.get('export_presets', {})
         self.prefs['export_presets'] = {name: choice for name, choice in raw_presets.items()
             if isinstance(name, str) and name.strip() and self.valid_choice(choice)} if isinstance(raw_presets, dict) else {}
+        self.quick_presets = {
+            'Quick: 1080p60': dict(encoder='CPU H.264', bitrate=16000, resolution=[1920,1080], fps=60),
+            'Quick: Smaller 720p30': dict(encoder='CPU H.264', bitrate=5000, resolution=[1280,720], fps=30),
+            'Quick: Vertical fit 1080p60': dict(encoder='CPU H.264', bitrate=12000, resolution=[1080,1920], fps=60),
+        }
         self.export_choice = self.prefs.get('last_export')
         if not self.valid_choice(self.export_choice):
             self.export_choice = None
         active = self.prefs.get('active_export_preset', '')
-        if not isinstance(active, str) or self.prefs['export_presets'].get(active) != self.export_choice:
+        if not isinstance(active, str) or (active not in self.quick_presets and self.prefs['export_presets'].get(active) != self.export_choice):
             self.prefs['active_export_preset'] = ''
         self.available_export_encoders = []
         self.player = QMediaPlayer(self)
-        self.audio_output = QAudioOutput(self)
+        self.audio_output = DefaultAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
         root = QWidget()
         layout = QVBoxLayout(root)
@@ -99,7 +110,12 @@ class Editor(QMainWindow):
         sidebar = QWidget()
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(10, 0, 0, 0)
-        split.addWidget(sidebar)
+        side.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        side_scroll = QScrollArea()
+        side_scroll.setMinimumWidth(360)
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setWidget(sidebar)
+        split.addWidget(side_scroll)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([840, 500])
@@ -144,7 +160,6 @@ class Editor(QMainWindow):
             button.setAccessibleName(button.toolTip())
             button.clicked.connect(lambda checked=False, d=direction: self.step_frame(d))
             steps.addWidget(button)
-        transport.addLayout(steps)
         selection = QPushButton('Play selection')
         selection.clicked.connect(self.play_selection)
         transport.addWidget(selection)
@@ -156,6 +171,7 @@ class Editor(QMainWindow):
         self.show_edits.setChecked(True)
         self.show_edits.toggled.connect(self.update_preview)
         preview_options.addWidget(self.show_edits)
+        preview_options.addLayout(steps)
         preview_options.addStretch()
         self.speed = QComboBox()
         self.speed.addItems(['0.25×', '0.5×', '1×', '1.5×', '2×'])
@@ -180,6 +196,8 @@ class Editor(QMainWindow):
         row.addWidget(self.start)
         row.addWidget(QLabel('End'))
         row.addWidget(self.end)
+        layout.addLayout(row)
+        row = QHBoxLayout()
         for label, callback in [('Open clip…', self.choose_clip), ('Browse clips…', self.browse_clips)]:
             button = QPushButton(label)
             button.clicked.connect(callback)
@@ -199,6 +217,8 @@ class Editor(QMainWindow):
         self.tracks.setColumnWidth(2, 80)
         self.tracks.verticalHeader().setDefaultSectionSize(46)
         self.tracks.verticalHeader().setVisible(False)
+        self.tracks.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.tracks.setItemDelegate(ItemDelegate(self.tracks))
         self.tracks.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tracks.setMinimumHeight(205)
         self.tracks.setMaximumHeight(210)
@@ -234,6 +254,18 @@ class Editor(QMainWindow):
         form.addRow(preset_buttons)
         form.addRow('Encoder', self.encoder)
         form.addRow('Bitrate', self.bitrate)
+        self.resolution = QComboBox()
+        for label, value in [('Source / crop size', None), ('1920 × 1080 (fit)', [1920,1080]), ('1280 × 720 (fit)', [1280,720]), ('1080 × 1920 (vertical fit)', [1080,1920])]:
+            self.resolution.addItem(label, value)
+        self.export_fps = QComboBox()
+        for label, value in [('Source FPS', 0), ('24 FPS', 24), ('30 FPS', 30), ('60 FPS', 60)]:
+            self.export_fps.addItem(label, value)
+        self.set_output_choice(self.export_choice or {})
+        form.addRow('Resolution', self.resolution)
+        form.addRow('Framerate', self.export_fps)
+        self.size_estimate = QLabel('Estimated size: open a clip')
+        self.size_estimate.setWordWrap(True)
+        form.addRow(self.size_estimate)
         side.addLayout(form)
         self.export_button = QPushButton('Export…')
         self.export_button.setObjectName('primary')
@@ -246,6 +278,9 @@ class Editor(QMainWindow):
         side.addLayout(row)
         self.progress = QProgressBar()
         side.addWidget(self.progress)
+        self.eta = ExportETA()
+        self.eta_label = QLabel()
+        side.addWidget(self.eta_label)
         self.status = QLabel('FFmpeg tools are required for inspection and export. File → FFmpeg folder to configure.')
         self.status.setWordWrap(True)
         side.addWidget(self.status)
@@ -283,6 +318,33 @@ class Editor(QMainWindow):
         self.preset.currentIndexChanged.connect(self.apply_export_preset)
         self.encoder.currentIndexChanged.connect(self.export_controls_changed)
         self.bitrate.valueChanged.connect(self.export_controls_changed)
+        self.resolution.currentIndexChanged.connect(self.export_controls_changed)
+        self.export_fps.currentIndexChanged.connect(self.export_controls_changed)
+        self.remix.toggled.connect(self.update_size_estimate)
+
+    def set_output_choice(self, choice):
+        for widget, key, default in ((self.resolution, 'resolution', None), (self.export_fps, 'fps', 0)):
+            widget.blockSignals(True)
+            widget.setCurrentIndex(max(0, widget.findData(choice.get(key, default))))
+            widget.blockSignals(False)
+
+    def output_choice(self, label):
+        choice = dict(encoder=label, bitrate=self.bitrate.value())
+        if self.resolution.currentData():
+            choice['resolution'] = self.resolution.currentData()
+        if self.export_fps.currentData():
+            choice['fps'] = self.export_fps.currentData()
+        return choice
+
+    def update_size_estimate(self, *_):
+        if hasattr(self, 'size_estimate') and self.info and hasattr(self, 'track_rows'):
+            estimate = estimated_size(self.current_edit()) / 1_000_000
+            self.size_estimate.setText(f'Estimated size: {estimate:.1f} MB · bitrate target; actual size varies with content and container overhead.')
+
+    def export_progress(self, percent):
+        self.progress.setValue(percent)
+        seconds = self.eta.update(percent)
+        self.eta_label.setText('Finishing…' if percent >= 99 else 'Time remaining: estimating…' if seconds is None else f'About {max(1, round(seconds))} s remaining')
 
     def browse_clips(self):
         if self.busy():
@@ -307,6 +369,7 @@ class Editor(QMainWindow):
     def update_timeline(self, *_):
         self.wave.start, self.wave.end = self.start.value(), self.end.value()
         self.wave.update()
+        self.update_size_estimate()
 
     def step_frame(self, direction):
         if not self.info:
@@ -367,7 +430,7 @@ class Editor(QMainWindow):
     def current_edit(self):
         audio = [(index, title, volume.value()/100) for index, title, check, volume, _ in self.track_rows if check.isChecked()]
         return Edit(self.start.value(), self.end.value(), self.encoder.currentData(), self.bitrate.value(),
-                    audio, self.crop, *self.colors, remix=self.remix.isChecked())
+                    audio, self.crop, *self.colors, remix=self.remix.isChecked(), resolution=self.resolution.currentData(), fps=self.export_fps.currentData())
 
     def preview_export(self):
         if self.busy() or not self.info:
@@ -397,7 +460,7 @@ class Editor(QMainWindow):
         video = QVideoWidget()
         layout.addWidget(video, 1)
         player = QMediaPlayer(dialog)
-        output = QAudioOutput(dialog)
+        output = DefaultAudioOutput(dialog)
         player.setAudioOutput(output)
         player.setVideoOutput(video)
         player.setSource(QUrl.fromLocalFile(path))
@@ -428,19 +491,23 @@ class Editor(QMainWindow):
     @staticmethod
     def valid_choice(choice):
         return (isinstance(choice, dict) and isinstance(choice.get('encoder'), str) and choice.get('encoder') in ENCODERS
-                and type(choice.get('bitrate')) is int and 1000 <= choice['bitrate'] <= 200000)
+                and type(choice.get('bitrate')) is int and 1000 <= choice['bitrate'] <= 200000
+                and choice.get('resolution') in (None, [1920,1080], [1280,720], [1080,1920])
+                and choice.get('fps', 0) in (0,24,30,60))
 
     def refresh_presets(self):
         active = self.prefs.get('active_export_preset', '')
         self.preset.blockSignals(True)
         self.preset.clear()
         self.preset.addItem('Custom / last used', '')
+        for name in self.quick_presets:
+            self.preset.addItem(name, name)
         for name in sorted(self.prefs['export_presets'], key=str.casefold):
             self.preset.addItem(name, name)
         index = self.preset.findData(active)
         self.preset.setCurrentIndex(max(0, index))
         self.preset.blockSignals(False)
-        self.delete_preset.setEnabled(self.preset.currentData() != '')
+        self.delete_preset.setEnabled(self.preset.currentData() in self.prefs['export_presets'])
 
     def export_ready(self):
         return self.info is not None and self.encoder.currentData() in self.available_export_encoders and not self.busy()
@@ -468,7 +535,8 @@ class Editor(QMainWindow):
         label = self.encoder.currentData()
         if label not in ENCODERS:
             return
-        self.export_choice = {'encoder': label, 'bitrate': self.bitrate.value()}
+        self.export_choice = self.output_choice(label)
+        self.update_size_estimate()
         self.prefs['last_export'] = dict(self.export_choice)
         self.prefs['active_export_preset'] = ''
         self.refresh_presets()
@@ -477,12 +545,15 @@ class Editor(QMainWindow):
 
     def apply_export_preset(self, *_):
         name = self.preset.currentData()
-        self.delete_preset.setEnabled(bool(name))
+        self.delete_preset.setEnabled(name in self.prefs['export_presets'])
         if not name:
             self.prefs['active_export_preset'] = ''
             self.save_prefs()
             return
-        choice = dict(self.prefs['export_presets'][name])
+        choice = dict(self.quick_presets[name] if name in self.quick_presets else self.prefs['export_presets'][name])
+        if name in self.quick_presets and self.encoder.currentData() in self.available_export_encoders:
+            choice['encoder'] = self.encoder.currentData()
+        self.set_output_choice(choice)
         self.export_choice = choice
         self.prefs['last_export'] = dict(choice)
         self.prefs['active_export_preset'] = name
@@ -490,6 +561,7 @@ class Editor(QMainWindow):
         self.bitrate.setValue(choice['bitrate'])
         self.bitrate.blockSignals(False)
         self.populate_export_encoders()
+        self.update_size_estimate()
         self.save_prefs()
         self.status.setText('Preset: ' + name + ('. Encoder unavailable; select an available encoder or recheck.'
             if choice['encoder'] not in self.available_export_encoders else '.'))
@@ -503,12 +575,15 @@ class Editor(QMainWindow):
         name = name.strip()
         if not ok or not name:
             return
+        if name in self.quick_presets:
+            self.error('Choose a different name from the built-in quick choices.')
+            return
         if name in self.prefs['export_presets']:
             answer = QMessageBox.question(self, 'Replace preset?', f'Replace the settings saved in “{name}”?',
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
                 return
-        choice = {'encoder': label, 'bitrate': self.bitrate.value()}
+        choice = self.output_choice(label)
         self.prefs['export_presets'][name] = choice
         self.prefs['active_export_preset'] = name
         self.prefs['last_export'] = dict(choice)
@@ -570,7 +645,7 @@ class Editor(QMainWindow):
             import subprocess
             import os
             result = subprocess.run([ffmpeg, '-v', 'error', '-ss', str(min(position, max(0, info['duration']-.1))), '-i', info['path'],
-                '-frames:v', '1', '-vf', 'scale=1280:-2', '-f', 'image2pipe', '-vcodec', 'png', '-'],
+                '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'png', '-'],
                 capture_output=True, timeout=30, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             if result.returncode or not result.stdout:
                 raise ValueError(result.stderr.decode('utf-8', 'replace')[-1500:] or 'Could not decode crop preview frame.')
@@ -621,11 +696,14 @@ class Editor(QMainWindow):
         self.job = Job(action, self)
         self.job.result.connect(on_result)
         self.job.failed.connect(self.error)
-        self.job.progress.connect(self.progress.setValue)
+        self.eta.reset()
+        self.eta_label.setText('Time remaining: estimating…' if exporting else '')
+        self.job.progress.connect(self.export_progress)
         self.job.finished.connect(self.job_finished)
         self.job.start()
 
     def job_finished(self):
+        self.eta_label.clear()
         job, self.job = self.job, None
         job.deleteLater()
         self.menuBar().setEnabled(True)
@@ -679,9 +757,7 @@ class Editor(QMainWindow):
             self.open_clip(path)
 
     def open_clip(self, path):
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        show_centered(self, self.parentWidget())
         if self.busy():
             self.status.setText('Wait for the current operation, or cancel the export, before opening another clip.')
             return
@@ -715,6 +791,7 @@ class Editor(QMainWindow):
             title = stream.get('tags', {}).get('title', f'Audio {i+1}')
             check = QCheckBox()
             check.setChecked(True)
+            check.toggled.connect(self.update_size_estimate)
             volume = QSpinBox()
             volume.setRange(0, 200)
             volume.setValue(100)
@@ -729,6 +806,7 @@ class Editor(QMainWindow):
         self.listen_row = 0
         self.wave_row = None
         self.remix_changed(self.remix.isChecked())
+        self.update_size_estimate()
         self.selection_playing = False
         self.player.setSource(QUrl.fromLocalFile(self.info['path']))
         self.player.pause()

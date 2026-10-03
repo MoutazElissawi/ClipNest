@@ -17,7 +17,7 @@ def dropped_clip(mime):
 
 
 def filtered_image(image, crop, colors, source_size=None):
-    """Bound preview work; RGB preview is approximate, FFmpeg owns final colors."""
+    """Preserve source pixels; RGB preview is approximate, FFmpeg owns final colors."""
     if image.isNull():
         return image
     if crop:
@@ -25,7 +25,6 @@ def filtered_image(image, crop, colors, source_size=None):
         x, y, w, h = crop
         image = image.copy(round(x*image.width()/sw), round(y*image.height()/sh),
                            max(1, round(w*image.width()/sw)), max(1, round(h*image.height()/sh)))
-    image = image.scaled(960, 540, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
     if colors == (0., 1., 1.):
         return image
     image = image.convertToFormat(QImage.Format.Format_RGBA8888)
@@ -110,6 +109,7 @@ class VideoCanvas(QWidget):
 
     def paintEvent(self, event):
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.fillRect(self.rect(), QColor('#0e0e0e'))
         if not self.display.isNull():
             size = self.display.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)

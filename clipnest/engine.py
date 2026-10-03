@@ -41,6 +41,9 @@ class Engine(QThread):
         self.rpc = None
         self.retiring_clients = []
         self.running = True
+        self.shutting_down = False
+        self.shutdown_started = None
+        self.shutdown_failures = 0
         self.catalog = Catalog(self.settings["games"])
         self.recording = False
         self.replay = False
@@ -58,6 +61,8 @@ class Engine(QThread):
         self.replay_started = None
         self.archive_retry = []
         self.next_retry = 0
+        self.recovery_intent = None
+        self.system_suspended = False
         if JOURNAL.exists():
             try:
                 data = json.loads(JOURNAL.read_text())
@@ -67,7 +72,62 @@ class Engine(QThread):
                 log.exception("Could not read pending-save journal")
 
     def submit(self, command, data=None):
-        self.commands.put((command, data))
+        if command == "shutdown":
+            self.begin_shutdown()
+        if not self.shutting_down or command == "shutdown":
+            self.commands.put((command, data))
+
+    def begin_shutdown(self):
+        self.shutting_down = True
+        if self.shutdown_started is None:
+            self.shutdown_started = time.monotonic()
+        elapsed = time.monotonic()-self.shutdown_started
+        for client in [self.rpc, *list(self.retiring_clients)]:
+            if client is not None and hasattr(client, 'begin_shutdown'):
+                client.begin_shutdown(timeout=max(.01, 20-elapsed))
+        if self.continuous is not None and hasattr(self.continuous, 'begin_shutdown'):
+            self.continuous.begin_shutdown(timeout=max(.01, 25-elapsed))
+
+    def finish_shutdown(self):
+        jobs, self.archive_retry = self.archive_retry, []
+        for path, ctx, kind, _ in jobs:
+            self.finish_file(path, ctx, kind, 10)
+        self.recording = self.replay = False
+        self.state.emit({"connected": False})
+        self.running = False
+        self.shutdown_done.emit(True)
+
+    def abort_shutdown(self):
+        """Last-resort cleanup after bounded retries; never resume capture."""
+        for client in [self.rpc, *list(self.retiring_clients)]:
+            if client is None:
+                continue
+            try:
+                client.force_stop()
+                client.disconnect()
+            except Exception:
+                log.exception('Could not complete native recorder cleanup')
+        self.rpc = None
+        self.retiring_clients.clear()
+        if self.continuous is not None:
+            try:
+                self.continuous.abort()
+                self.continuous.close()
+                self.drain_continuous()
+            except Exception:
+                log.exception('Replay cache retained after interrupted cleanup')
+            self.continuous = None
+        self.message.emit('Closing after a recorder timeout. Unfinished files remain in _Unsorted; check recorder logs.')
+        self.finish_shutdown()
+
+    def shutdown_failed(self, exc):
+        log.exception('Shutdown still finishing')
+        self.shutdown_failures += 1
+        if self.shutdown_failures >= 3 or time.monotonic()-self.shutdown_started >= 28:
+            self.abort_shutdown()
+        else:
+            self.message.emit(f'Still closing the recorder: {exc}')
+            self.msleep(250)
 
     def journal(self):
         atomic_json(JOURNAL, {"record": self.record_context, "replay": self.pending_replay})
@@ -78,6 +138,12 @@ class Engine(QThread):
         except Exception:
             log.exception("Game discovery failed")
         while self.running:
+            if self.shutting_down:
+                try:
+                    self.handle("shutdown", None)
+                except Exception as exc:
+                    self.shutdown_failed(exc)
+                continue
             try:
                 command, data = self.commands.get(timeout=.025)
             except queue.Empty:
@@ -87,10 +153,13 @@ class Engine(QThread):
                     self.handle(command, data)
                 except Exception as exc:
                     log.exception("Command failed: %s", command)
+                    if command == "shutdown":
+                        self.shutdown_failed(exc)
+                        continue
                     self.expected_stops.clear()
                     self.error.emit(str(exc))
-                    if command == "shutdown":
-                        self.shutdown_done.emit(False)
+            if self.shutting_down:
+                continue
             self.drain_continuous()
             if self.rpc:
                 try:
@@ -138,7 +207,7 @@ class Engine(QThread):
                     self.message.emit("Replay footage expired or a segment failed before this save; continuity across that missing interval is not available.")
             else:
                 self.error.emit("Continuous replay: " + value + ". Cache segments are retained under _Unsorted/_ReplayCache.")
-                if context:
+                if context and kind != 'aborted' and not self.shutting_down:
                     self.pending_replay = None
                     self.journal()
 
@@ -160,7 +229,11 @@ class Engine(QThread):
         return self.rpc.call(method, **args)
 
     def context(self):
-        return {"output": self.settings["output"], "category": self.catalog.poll()["category"], "requested": time.time()}
+        app = self.catalog.poll()
+        context = {"output": self.settings["output"], "category": app["category"], "requested": time.time()}
+        log.info("Save context pid=%s name=%r exe=%r category=%r requested=%s", app.get("pid"),
+                 app.get("name"), app.get("exe"), context["category"], context["requested"])
+        return context
 
     def connect_engine(self):
         if self.rpc:
@@ -204,7 +277,7 @@ class Engine(QThread):
         inputs = {i["inputName"] for i in self.call("GetInputList")["inputs"]}
         self.call("SetCurrentProgramScene", sceneName=SCENE)
         for name, prefix, settings in [(SCREEN, "monitor_capture", {"capture_cursor": True, "method": self.settings.get("capture_method", 2)}),
-                                       (DESKTOP, "wasapi_output_capture", {"device_id": self.settings["desktop_device"]}),
+                                       (DESKTOP, "wasapi_output_capture", {"device_id": self.settings["desktop_device"], "use_device_timing": False}),
                                        (MIC, "wasapi_input_capture", {"device_id": self.settings["mic_device"]})]:
             if name not in inputs:
                 kind = next((k for k in reversed(kinds) if k == prefix or k.startswith(prefix + "_v")), None)
@@ -291,7 +364,7 @@ class Engine(QThread):
                          "timecode": rec["outputTimecode"], "app": self.catalog.poll(),
                          "replay_seconds": self.settings["replay_seconds"], "buffered": elapsed,
                          "capture_attached": rec.get("captureAttached", False), "capture_method": rec.get("captureMethod", self.settings.get("capture_method", 2)),
-                         "saving": self.pending_replay is not None, "muted": self.muted})
+                         "saving": self.pending_replay is not None, "muted": self.muted, "stats": rec.get("stats", {})})
 
     def on_event(self, kind, data):
         if kind == "NativeNotice":
@@ -310,8 +383,9 @@ class Engine(QThread):
                 self.last_meter = now
                 self.meters.emit(dict(self.meter_levels))
         elif kind == "ReplaySaveFailed":
-            self.pending_replay = None
-            self.journal()
+            if not self.shutting_down:
+                self.pending_replay = None
+                self.journal()
             self.error.emit(data.get("message", "Replay save failed."))
         elif kind == "ReplaySegmentClosed":
             if self.continuous is not None:
@@ -375,9 +449,129 @@ class Engine(QThread):
         if result.get("outputPath"):
             self.finish_file(result["outputPath"], ctx, "Recording")
 
+    def retire_for_recovery(self, reason):
+        """Finalize old files before rebuilding the D3D/WASAPI host after resume."""
+        if self.recovery_intent is None:
+            if not self.rpc:
+                return
+            self.recovery_intent = dict(record=self.recording, replay=self.replay)
+        if self.record_context:
+            self.record_context['interrupted'] = True
+            self.journal()
+        self.expected_stops.update(('record', 'replay'))
+        self.message.emit(reason + '. Finalizing the previous capture session...')
+        if self.rpc:
+            client = self.rpc
+            for kind, method in (('record', 'StopRecord'), ('replay', 'StopReplayBuffer')):
+                try:
+                    if self.call('GetRecordStatus' if kind == 'record' else 'GetReplayBufferStatus')['outputActive']:
+                        if kind == 'record':
+                            self.stop_record()
+                        else:
+                            self.call(method)
+                except Exception:
+                    log.exception('Output stop during recovery: %s', kind)
+            try:
+                client.close()
+            except Exception:
+                if client.process.poll() is None:
+                    # Never create a second recorder while the old process still owns files.
+                    raise
+                log.exception('Old recorder exited during recovery')
+            self.rpc = None
+        self.recording = self.replay = False
+        self.replay_started = None
+        self.announced_active = {'record': False, 'replay': False}
+        self.state.emit({'connected': False})
+        if self.continuous is not None:
+            self.continuous.close()
+            self.drain_continuous()
+            self.continuous = None
+        if self.pending_replay:
+            self.error.emit('A replay save was interrupted by the display/session change. Check _Unsorted and _ReplayCache for recoverable files.')
+        self.expected_stops.clear()
+
+    def recover_capture(self, reason):
+        self.retire_for_recovery(reason)
+        if self.recovery_intent is None or self.shutting_down:
+            return
+        intent = self.recovery_intent
+        # One attempt per Windows event. A failure stays stopped instead of retrying forever.
+        self.recovery_intent = None
+        self.connect_engine()
+        if self.shutting_down:
+            return
+        if intent['replay']:
+            self.handle('toggle_replay', None)
+        if intent['record'] and not self.shutting_down:
+            self.handle('toggle_record', None)
+        self.notify('Capture recovered', 'A fresh session started. Footage across sleep/lock/display changes is not continuous.' if any(intent.values()) else 'Recorder devices reconnected.')
+
+    def apply_audio_devices(self, data=None):
+        proposed = {key: (data or self.settings).get(key, self.settings[key])
+                    for key in ('desktop_device', 'mic_device')}
+        if not all(isinstance(value, str) and value for value in proposed.values()):
+            raise ValueError('Choose valid audio devices.')
+        if self.rpc:
+            sources = []
+            unavailable = []
+            for key, name, mask in (('desktop_device', DESKTOP, 3), ('mic_device', MIC, 5)):
+                device = proposed[key]
+                devices = self.call('GetInputPropertiesListPropertyItems', inputName=name,
+                                    propertyName='device_id')['propertyItems']
+                if device != 'default' and not any(d['itemValue'] == device and d.get('itemEnabled', True) for d in devices):
+                    detail = f'{name}: the selected device is disconnected. Reconnect it or choose System default in Audio settings.'
+                    if data is not None:
+                        raise ValueError(detail)
+                    unavailable.append(detail)
+                    continue
+                sources.append(dict(inputName=name, device_id=device, mixers=mask,
+                                    volume=self.settings['mic_volume']/100 if name == MIC else 1.0,
+                                    muted=bool(self.muted) if name == MIC else False))
+            if sources:
+                self.call('ReconnectAudioSources', sources=sources)
+            self.meter_levels.clear()
+            self.meters.emit({})
+            for detail in unavailable:
+                self.notify('Audio device unavailable', detail, 'error')
+                self.message.emit(detail)
+        self.settings.update(proposed)
+        atomic_json(SETTINGS, self.settings)
+        if data is not None:
+            self.applied.emit(copy.deepcopy(self.settings))
+        if self.rpc:
+            self.read_devices()
+            self.message.emit('Available audio devices reconnected. Video capture continues; a brief audio gap during endpoint switching is expected.')
+        else:
+            self.message.emit('Audio device choices saved for the next capture session.')
+
     def handle(self, command, data):
+        if self.shutting_down and command != "shutdown":
+            return
+        if command == 'suspend_capture':
+            self.system_suspended = True
+            self.retire_for_recovery(str(data))
+            if self.recovery_intent and any(self.recovery_intent.values()):
+                self.notify('Capture paused', str(data) + '. Capture will restart in a fresh session after unlock/resume.', 'error')
+            return
+        if command == 'recover_capture':
+            self.system_suspended = False
+            try:
+                self.recover_capture(str(data or 'Display resumed'))
+            except Exception:
+                self.notify('Capture recovery failed', 'Capture needs attention. Check the log and restart the engine.', 'error')
+                raise
+            return
+        if self.system_suspended and command in ('connect', 'toggle_replay', 'toggle_record', 'save_replay'):
+            self.message.emit('Capture is paused until Windows resumes and the session is unlocked.')
+            return
         if command == "connect":
             self.connect_engine()
+        elif command == 'apply_audio':
+            self.apply_audio_devices(data)
+        elif command == 'audio_devices_changed':
+            if self.rpc and not self.system_suspended:
+                self.apply_audio_devices()
         elif command == "toggle_replay":
             self.replay = self.call("GetReplayBufferStatus")["outputActive"]
             if self.replay and self.pending_replay:
@@ -432,6 +626,16 @@ class Engine(QThread):
                     self.call("SetInputVolume", inputName=MIC, inputVolumeMul=volume / 100)
             if changed:
                 atomic_json(SETTINGS, self.settings)
+        elif command == "ui_theme":
+            theme = str(data.get("theme", "dark") if isinstance(data, dict) else data or "dark")
+            tint = int(data.get("tint", 46) if isinstance(data, dict) else self.settings.get("glass_tint", 46))
+            if not 25 <= tint <= 85:
+                raise ValueError("Glass tint must be between 25 and 85 percent.")
+            if theme not in ("dark", "glass"):
+                raise ValueError("Choose a supported appearance.")
+            self.settings.update(ui_theme=theme, glass_tint=tint)
+            atomic_json(SETTINGS, self.settings)
+            self.message.emit("Appearance saved as " + ("Frosted glass." if theme == "glass" else "Classic dark."))
         elif command == "apply":
             validate(data)
             if self.rpc:
@@ -465,28 +669,47 @@ class Engine(QThread):
         elif command == "refresh_devices":
             self.read_devices()
         elif command == "shutdown":
+            self.begin_shutdown()
+            self.expected_stops.update(("record", "replay"))
             if self.rpc:
-                if self.call("GetRecordStatus")["outputActive"]:
-                    self.stop_record()
-                deadline = time.monotonic() + 12
-                while self.pending_replay and time.monotonic() < deadline:
-                    self.rpc.pump()
-                    self.drain_continuous()
-                    self.msleep(30)
-                if self.pending_replay:
-                    raise RuntimeError("Replay is still saving. Wait a moment, then exit again.")
-                if self.call("GetReplayBufferStatus")["outputActive"]:
-                    self.expected_stops.add('replay')
-                    self.call("StopReplayBuffer")
-                # Retry any final rename after OBS has released its handles.
-                for path, ctx, kind, _ in self.archive_retry:
-                    self.finish_file(path, ctx, kind, 10)
-                self.archive_retry.clear()
-                self.rpc.close()
+                client = self.rpc
+                if not client.closed:
+                    # A failed stop must not skip the other output or host cleanup.
+                    try:
+                        if self.call("GetRecordStatus")["outputActive"]:
+                            self.stop_record()
+                    except Exception:
+                        log.exception("Recording stop failed; continuing native shutdown")
+                    deadline = min(time.monotonic() + 12, self.shutdown_started + 12)
+                    while self.pending_replay and time.monotonic() < deadline:
+                        try:
+                            client.pump()
+                        except Exception:
+                            break
+                        self.drain_continuous()
+                        self.msleep(30)
+                    try:
+                        if self.call("GetReplayBufferStatus")["outputActive"]:
+                            self.call("StopReplayBuffer")
+                    except Exception:
+                        log.exception("Replay stop failed; continuing native shutdown")
+                try:
+                    client.close()
+                except Exception:
+                    if client.process.poll() is None:
+                        raise
+                    log.exception("Native host exited without a clean shutdown reply")
+                if getattr(client, 'forced', False) and self.continuous is not None:
+                    self.continuous.abort()
+                    self.message.emit('The recorder stalled while closing. Unfinished files and replay cache have been retained in _Unsorted.')
                 self.rpc = None
-                self.state.emit({"connected": False})
+            # Clients retired after a connection failure also belong to this app.
+            for client in list(self.retiring_clients):
+                client.disconnect()
+                self.retiring_clients.remove(client)
             if self.continuous is not None:
                 self.continuous.close()
+                self.drain_continuous()
                 self.continuous = None
-            self.running = False
-            self.shutdown_done.emit(True)
+            # Retry sorting only after native file handles and replay jobs finish.
+            self.finish_shutdown()

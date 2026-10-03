@@ -12,9 +12,9 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '1.5.1'
+VERSION = '1.8.0'
 PUBLIC_FILES = ('main.py', 'bootstrap.py', 'Launch_ClipNest.pyw', 'Launch_ClipNest.vbs',
-                'Start_ClipNest.bat', 'requirements.txt', 'LICENSE.txt', 'THIRD_PARTY.md', 'README.md')
+                'Start_ClipNest.bat', 'Launch_Classic_Mode.bat', 'requirements.txt', 'LICENSE.txt', 'THIRD_PARTY.md', 'README.md')
 
 
 def copy_public(destination, *, build_sources=True):
@@ -76,6 +76,8 @@ def build(args):
     compiler = find_compiler(args.iscc)
     if not args.stage_only and not compiler:
         raise RuntimeError('Install Inno Setup 6.3+ from https://jrsoftware.org/isdl.php, then retry; or supply --iscc PATH.')
+    from launchers import build_launchers, check_launcher, find_csc
+    launcher_compiler = find_csc()
     payload = ROOT / 'build' / 'installer-payload'
     # Only this disposable, fixed build directory is removed.
     if payload.exists():
@@ -86,10 +88,12 @@ def build(args):
     subprocess.run([sys.executable, '-m', 'pip', 'install', '--isolated', '--only-binary=:all:',
                     '--ignore-installed', '--no-compile', '--target', str(runtime / 'Lib/site-packages'),
                     '-r', str(ROOT / 'requirements.txt')], check=True)
+    build_launchers(payload, VERSION, launcher_compiler)
     env = os.environ.copy()
     for key in ('PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP'):
         env.pop(key, None)
     env['PYTHONNOUSERSITE'] = '1'
+    check_launcher(payload, env)
     # Exercise the copied interpreter and Qt without the build machine's packages.
     check = ('import sys, ssl, ctypes, PySide6, psutil, numpy; from pathlib import Path; '
              'from PySide6 import QtWidgets, QtMultimedia; '
@@ -99,15 +103,20 @@ def build(args):
     # Check the recorder's relocated interpreter without touching user runtime data.
     with tempfile.TemporaryDirectory(prefix='clipnest-host-check-') as temp:
         host_dir = Path(temp)
-        shutil.copy2(runtime / 'python.exe', host_dir / 'clipnest-host.exe')
+        shutil.copy2(runtime / 'ClipNestRecorder.exe', host_dir / 'clipnest-host.exe')
         for dll in runtime.glob('*.dll'):
             shutil.copy2(dll, host_dir / dll.name)
         host_env = env.copy()
         host_env['PYTHONHOME'] = str(runtime)
         host_env['PYTHONPATH'] = str(payload)
-        subprocess.run([str(host_dir / 'clipnest-host.exe'), '-s', '-c',
-                        'import ssl, ctypes, clipnest.native_host; print("Recorder host imports OK")'],
-                       cwd=payload, env=host_env, check=True)
+        checked = subprocess.run([str(host_dir / 'clipnest-host.exe'), '-u', '-s', '-c',
+                        'import ssl, ctypes, sys, clipnest.native_host; from pathlib import Path; '
+                        'assert Path(sys.executable).name == "clipnest-host.exe"; '
+                        'print(sys.stdin.readline().strip(), flush=True)'],
+                       cwd=payload, env=host_env, check=True, timeout=60,
+                       input='ClipNest recorder pipe check\n', capture_output=True, text=True)
+        if checked.stdout.strip() != 'ClipNest recorder pipe check':
+            raise RuntimeError('Branded recorder failed its inherited stdin/stdout check')
     if args.ffmpeg_dir:
         copy_ffmpeg(args.ffmpeg_dir, payload / 'tools/ffmpeg')
         for name in ('ffmpeg', 'ffprobe'):
@@ -136,7 +145,7 @@ def main():
     args = parser.parse_args()
     try:
         build(args)
-    except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f'Build failed: {exc}', file=sys.stderr)
         return 1
     return 0
