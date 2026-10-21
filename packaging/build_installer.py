@@ -12,9 +12,10 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '1.8.0'
-PUBLIC_FILES = ('main.py', 'bootstrap.py', 'Launch_ClipNest.pyw', 'Launch_ClipNest.vbs',
-                'Start_ClipNest.bat', 'Launch_Classic_Mode.bat', 'requirements.txt', 'LICENSE.txt', 'THIRD_PARTY.md', 'README.md')
+VERSION = '2.0.0-beta.12'
+# Only what the app needs to run, plus its license notices and README.
+PUBLIC_FILES = ('main.py', 'bootstrap.py', 'Launch_ClipNest.pyw', 'Start_ClipNest.bat', 'Launch_Classic_Mode.bat',
+                'requirements.txt', 'LICENSE.txt', 'THIRD_PARTY.md', 'README.md')
 
 
 def copy_public(destination, *, build_sources=True):
@@ -24,9 +25,9 @@ def copy_public(destination, *, build_sources=True):
     shutil.copytree(ROOT / 'clipnest', destination / 'clipnest',
                     ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     if build_sources:
+        # GPL: the installer ships its build scripts and launcher source (packaging/, incl. Build_Installer.bat).
         shutil.copytree(ROOT / 'packaging', destination / 'packaging',
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
-        shutil.copy2(ROOT / 'Build_Installer.bat', destination)
 
 
 def copy_runtime(base, destination):
@@ -88,7 +89,7 @@ def build(args):
     subprocess.run([sys.executable, '-m', 'pip', 'install', '--isolated', '--only-binary=:all:',
                     '--ignore-installed', '--no-compile', '--target', str(runtime / 'Lib/site-packages'),
                     '-r', str(ROOT / 'requirements.txt')], check=True)
-    build_launchers(payload, VERSION, launcher_compiler)
+    build_launchers(payload, VERSION.split('-')[0], launcher_compiler)
     env = os.environ.copy()
     for key in ('PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP'):
         env.pop(key, None)

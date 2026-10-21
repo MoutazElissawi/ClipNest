@@ -53,6 +53,7 @@ class VideoCanvas(QWidget):
         self.source_size = None
         self.show_edits = True
         self.hover = False
+        self.frames_suspended = False
         self.pending_frame = None
         self.frame_timer = QTimer(self)
         self.frame_timer.setSingleShot(True)
@@ -64,10 +65,21 @@ class VideoCanvas(QWidget):
         if frame.isValid():
             # Coalesce within a 16 ms budget for 60 fps playback; never queue old images.
             self.pending_frame = frame
-            if not self.frame_timer.isActive():
+            if not self.frames_suspended and not self.frame_timer.isActive():
                 self.frame_timer.start()
 
+    def suspend_frames(self):
+        self.frames_suspended = True
+        self.frame_timer.stop()
+
+    def resume_frames(self):
+        self.frames_suspended = False
+        if self.pending_frame is not None and not self.frame_timer.isActive():
+            self.frame_timer.start()
+
     def flush_frame(self):
+        if self.frames_suspended:
+            return
         frame, self.pending_frame = self.pending_frame, None
         if frame is not None:
             self.set_image(frame.toImage())
@@ -126,6 +138,7 @@ class VideoCanvas(QWidget):
 
 class Waveform(QWidget):
     seek = Signal(int)
+    region_changed = Signal(object)  # (start, end) seconds, or None
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,16 +148,42 @@ class Waveform(QWidget):
         self.duration = 0
         self.position = 0
         self.start = self.end = 0
+        self.muted = []      # muted (start, end) ranges of the shown track, seconds
+        self.region = None   # selected (start, end) range, seconds
+        self.region_anchor = None
         self.label = 'Waveform appears when a clip is loaded'
-        self.setToolTip('Click or drag to seek. Blue marks the selected A–B range.')
+        self.setToolTip('Click or drag to seek. Shift+drag selects an audio range to mute, cut or keep. '
+                        'Gray marks the A–B export range; red marks muted audio on this track.')
+
+    def seconds_at(self, x):
+        return max(0., min(1., x/max(1, self.width()-1)))*self.duration
+
+    def set_region(self, region):
+        self.region = region if region and region[1] - region[0] > 1e-3 else None
+        self.region_changed.emit(self.region)
+        self.update()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.duration:
-            self.seek.emit(round(max(0., min(1., event.position().x()/max(1, self.width()-1)))*self.duration*1000))
+        if event.button() != Qt.MouseButton.LeftButton or not self.duration:
+            return
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.region_anchor = self.seconds_at(event.position().x())
+            self.set_region(None)
+            return
+        self.region_anchor = None
+        self.seek.emit(round(self.seconds_at(event.position().x())*1000))
 
     def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self.mousePressEventProxy(event)
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            return
+        if self.region_anchor is not None:
+            here = self.seconds_at(event.position().x())
+            self.set_region((min(here, self.region_anchor), max(here, self.region_anchor)))
+            return
+        self.mousePressEventProxy(event)
+
+    def mouseReleaseEvent(self, event):
+        self.region_anchor = None
 
     def mousePressEventProxy(self, event):
         if self.duration:
@@ -160,11 +199,19 @@ class Waveform(QWidget):
             p.setPen(QColor('#c9c9c9'))
             p.drawText(int(a)+3, 13, 'A')
             p.drawText(max(0, min(w-13, int(b)-13)), 13, 'B')
+            for ma, mb in self.muted:
+                p.fillRect(QRectF(ma/self.duration*w, 0, max(1, (mb-ma)/self.duration*w), h), QColor(170, 30, 30, 150))
         p.setPen(QPen(QColor('#76b900'), 1))
         for i, peak in enumerate(self.peaks):
             x = round(i*w/max(1, len(self.peaks)-1))
             amp = float(peak)*(h/2-16)
             p.drawLine(x, round(h/2-amp), x, round(h/2+amp))
+        if self.duration and self.region:
+            ra, rb = self.region
+            p.fillRect(QRectF(ra/self.duration*w, 0, max(1, (rb-ra)/self.duration*w), h), QColor(255, 220, 69, 70))
+            p.setPen(QPen(QColor('#ffdc45'), 1))
+            p.drawLine(round(ra/self.duration*w), 0, round(ra/self.duration*w), h)
+            p.drawLine(round(rb/self.duration*w), 0, round(rb/self.duration*w), h)
         if self.duration:
             p.setPen(QPen(QColor('#ffffff'), 2))
             x = round(self.position/self.duration/1000*w)

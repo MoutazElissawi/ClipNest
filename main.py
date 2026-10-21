@@ -43,6 +43,7 @@ def main():
             atomic_json(SETTINGS, settings)
         if '--safe-ui' in sys.argv:
             settings['ui_theme'] = 'dark'
+            settings['theme_file'] = ''
         logging.info('ClipNest %s; source=%s; executable=%s; theme=%s; tint=%s; safe_ui=%s',
                      __version__, Path(__file__).resolve(), sys.executable, settings['ui_theme'],
                      settings['glass_tint'], '--safe-ui' in sys.argv)

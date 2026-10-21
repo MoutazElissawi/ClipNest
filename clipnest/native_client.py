@@ -48,6 +48,7 @@ class NativeClient:
         self.shutdown_deadline = None
         self.shutdown_timer = None
         self.forced = False
+        self.finalized = False
         self._shutdown_lock = threading.Lock()
         self._stop_lock = threading.Lock()
         DATA.mkdir(parents=True, exist_ok=True)
@@ -102,6 +103,8 @@ class NativeClient:
             if msg.get("id") == ident:
                 if "error" in msg: raise NativeError(msg["error"])
                 return msg.get("result", {})
+            if msg.get("event") == "OutputsFinalized":
+                self.outputs_finalized()
             self.dispatch(msg)
         raise TimeoutError(f"Native engine timed out during {method}. Check native-engine.log.")
 
@@ -124,12 +127,29 @@ class NativeClient:
             self.shutdown_timer.daemon = True
             self.shutdown_timer.start()
 
+    def outputs_finalized(self, grace=5):
+        """Recordings are closed; native teardown gets a short grace instead of the full deadline."""
+        with self._shutdown_lock:
+            self.finalized = True
+            deadline = time.monotonic() + grace
+            if self.shutdown_deadline is not None and self.shutdown_deadline <= deadline:
+                return
+            if self.shutdown_timer is not None:
+                self.shutdown_timer.cancel()
+            self.shutdown_deadline = deadline
+            self.shutdown_timer = threading.Timer(grace, self.force_stop)
+            self.shutdown_timer.daemon = True
+            self.shutdown_timer.start()
+
     def force_stop(self):
         with self._stop_lock:
             if self.process.poll() is not None:
                 return
             self.forced = True
-            logging.error('Native recorder did not finish in time; terminating owned child PID %s. Staging files are retained.', self.process.pid)
+            if self.finalized:
+                logging.warning('Native recorder teardown stalled after its files were closed; terminating owned child PID %s. See native-engine.log for the thread dump.', self.process.pid)
+            else:
+                logging.error('Native recorder did not finish in time; terminating owned child PID %s. Staging files are retained.', self.process.pid)
             try:
                 self.process.terminate()
                 self.process.wait(timeout=1)

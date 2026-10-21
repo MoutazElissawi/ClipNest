@@ -14,7 +14,8 @@ class CropCanvas(QWidget):
         self.setMouseTracking(True)
 
     def picture_rect(self):
-        scale = min(self.width()/self.source_width, self.height()/self.source_height)
+        # Leave room outside the image so full-frame corner handles are reachable.
+        scale = min((self.width()-48)/self.source_width, (self.height()-48)/self.source_height)
         w, h = self.source_width*scale, self.source_height*scale
         return QRectF((self.width()-w)/2, (self.height()-h)/2, w, h)
 
@@ -47,21 +48,28 @@ class CropCanvas(QWidget):
         p.drawRect(r)
         p.setBrush(QColor('#ffffff'))
         for point in (r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()):
-            p.drawRect(QRectF(point.x()-6, point.y()-6, 12, 12))
+            p.drawRect(QRectF(point.x()-8, point.y()-8, 16, 16))
         p.setPen(QColor('white'))
         p.drawText(12, 24, 'Crop: ' + ' × '.join(map(str, self.selection()[2:])))
 
     def rect_or_widget(self):
         return QRectF(0, 0, self.width(), self.height())
 
+    def corner_at(self, position):
+        area = self.picture_rect()
+        scale = area.width()/self.source_width
+        corners = [self.rect.topLeft(), self.rect.topRight(), self.rect.bottomLeft(), self.rect.bottomRight()]
+        distances = [max(abs(area.x()+p.x()*scale-position.x()), abs(area.y()+p.y()*scale-position.y())) for p in corners]
+        nearest = min(range(4), key=distances.__getitem__)
+        return nearest if distances[nearest] <= 24 else None
+
     def mousePressEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton or not self.picture_rect().contains(event.position()):
+        nearest = self.corner_at(event.position())
+        if event.button() != Qt.MouseButton.LeftButton or (nearest is None and not self.picture_rect().contains(event.position())):
             return
         point = self.to_source(event.position())
         corners = [self.rect.topLeft(), self.rect.topRight(), self.rect.bottomLeft(), self.rect.bottomRight()]
-        tolerance = 18*self.source_width/self.picture_rect().width()
-        nearest = min(range(4), key=lambda i: (corners[i]-point).manhattanLength())
-        if (corners[nearest]-point).manhattanLength() <= tolerance:
+        if nearest is not None:
             self.drag = ('corner', corners[3-nearest])
         elif self.rect.contains(point):
             self.drag = ('move', point, QRectF(self.rect))
@@ -71,6 +79,11 @@ class CropCanvas(QWidget):
 
     def mouseMoveEvent(self, event):
         if not self.drag:
+            corner = self.corner_at(event.position())
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor if corner in (0, 3) else
+                           Qt.CursorShape.SizeBDiagCursor if corner in (1, 2) else
+                           Qt.CursorShape.SizeAllCursor if self.picture_rect().contains(event.position()) and self.rect.contains(self.to_source(event.position())) else
+                           Qt.CursorShape.ArrowCursor)
             return
         point = self.to_source(event.position())
         if self.drag[0] == 'corner':
@@ -98,7 +111,7 @@ class CropDialog(QDialog):
         self.setWindowTitle('Drag crop corners')
         self.resize(900, 650)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel('Drag any white corner; drag inside the box to move it. The blue box is the exported area.'))
+        layout.addWidget(QLabel('Drag near any white corner to resize; drag inside to move. The green box is the exported area.'))
         self.canvas = CropCanvas(image, width, height, crop)
         layout.addWidget(self.canvas, 1)
         reset = QPushButton('Use full image')

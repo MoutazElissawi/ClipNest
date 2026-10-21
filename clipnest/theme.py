@@ -394,6 +394,13 @@ def apply_native_backdrop(window, value):
 
 
 CHROME_STYLE = """
+QScrollBar:vertical { background: #12200e; width: 9px; margin: 0; }
+QScrollBar:horizontal { background: #12200e; height: 9px; margin: 0; }
+QScrollBar::handle:vertical { background: #365f19; border-radius: 4px; min-height: 25px; }
+QScrollBar::handle:horizontal { background: #365f19; border-radius: 4px; min-width: 25px; }
+QScrollBar::handle:hover { background: #487e22; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
+QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 QGroupBox#captureCard { margin-top: 0; padding: 16px; }
 QLabel#cardTitle { font-size: 12pt; font-weight: 650; }
 QComboBox { min-height: 24px; }
@@ -417,8 +424,17 @@ def apply_theme(window, value, extra_qss=""):
     value = normalize_theme(value)
     window._theme = value
     surface = 'transparent' if getattr(window, '_native_backdrop_allowed', False) else '#101010'
-    window.setStyleSheet(theme_style(value) + extra_qss + CHROME_STYLE +
-                        '\nQMainWindow, QWidget#shell { background: ' + surface + '; }')
+    from .external_theme import palette_style, apply_inline_palettes
+    from PySide6.QtCore import QTimer
+    window.setStyleSheet(palette_style(theme_style(value) + extra_qss + CHROME_STYLE +
+                        '\nQMainWindow, QWidget#shell { background: ' + surface + '; }'))
+    apply_inline_palettes(window)
+    # Constructors call apply_theme before adding their children.
+    def finish():
+        import shiboken6
+        if shiboken6.isValid(window):
+            apply_inline_palettes(window)
+    QTimer.singleShot(0, finish)
     if hasattr(window, 'schedule_backdrop'):
         window.schedule_backdrop()
     window.update()

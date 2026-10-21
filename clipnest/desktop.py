@@ -6,8 +6,47 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl, QPropertyAnimation, QEasingCurve, QAbstractAnimation
 from PySide6.QtGui import QDesktopServices, QCursor, QPen
 from PySide6.QtWidgets import (QApplication, QListWidget, QAbstractItemView,
-                               QStyledItemDelegate, QStyle, QStyleOptionViewItem)
+                               QStyledItemDelegate, QStyle, QStyleOptionViewItem, QSlider, QStyleOptionSlider)
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices
+
+
+class SeekSlider(QSlider):
+    """A left click on the track seeks immediately; dragging and keys still work."""
+    def seek_to_mouse(self, event):
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderHandle, self)
+        span = max(1, self.width() - handle.width())
+        position = round(event.position().x() - handle.width()/2)
+        value = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                               max(0, min(span, position)), span, option.upsideDown)
+        self.setValue(value)
+        self.sliderMoved.emit(value)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.setSliderDown(True)
+            self.seek_to_mouse(event)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.isSliderDown() and event.buttons() & Qt.MouseButton.LeftButton:
+            self.seek_to_mouse(event)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.isSliderDown():
+            self.seek_to_mouse(event)
+            self.setSliderDown(False)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
 
 def show_centered(window, anchor=None):
@@ -23,7 +62,8 @@ def show_centered(window, anchor=None):
         extra_h = margins.top() + margins.bottom() if margins else 0
         width, height = max(1, area.width()-extra_w-24), max(1, area.height()-extra_h-24)
         window.setMinimumSize(min(window.minimumWidth(), width), min(window.minimumHeight(), height))
-        window.resize(min(window.size().width(), width), min(window.size().height(), height))
+        preferred = window.preferred_open_size() if hasattr(window, 'preferred_open_size') else window.size()
+        window.resize(min(preferred.width(), width), min(preferred.height(), height))
         frame = window.frameGeometry()
         frame.moveCenter(area.center())
         window.move(frame.topLeft())

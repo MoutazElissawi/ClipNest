@@ -7,8 +7,8 @@ The builder also uses the .NET Framework 4.x C# compiler at `%SystemRoot%\Micros
 The batch launcher automatically selects a supported 64-bit Python version, preferring 3.11.
 
 1. Extract the developer ZIP. Finish recording and quit existing ClipNest instances.
-2. Double-click `Build_Installer.bat`. Internet is needed to obtain Python packages.
-3. Find `dist/ClipNest-Setup-1.8.0-x64.exe` and its SHA-256 file.
+2. Double-click `packaging\Build_Installer.bat`. Internet is needed to obtain Python packages.
+3. Find `dist/ClipNest-Setup-<version>-x64.exe` and its SHA-256 file.
 4. Run the acceptance checks in `TESTCASES.md` before sharing the installer.
 
 To choose a Python version explicitly: `py -3.12 packaging/build_installer.py`.
@@ -27,7 +27,7 @@ Default builds retain the existing separate FFmpeg requirement. To include it:
 
 - Prepare a folder with `ffmpeg.exe`, `ffprobe.exe`, any required DLLs, and the selected distribution's license/notice files.
 - Include a `REDISTRIBUTION.md` identifying the exact build, its origin, configuration and how recipients receive its corresponding source. Keep needed source archives with the folder or distribute corresponding source alongside the release as required by that build's license. A link or a file named REDISTRIBUTION.md alone is not a compliance guarantee.
-- Run `Build_Installer.bat --ffmpeg-dir "C:\your\prepared-ffmpeg"`.
+- Run `packaging\Build_Installer.bat --ffmpeg-dir "C:\your\prepared-ffmpeg"`.
 
 The whole supplied folder is copied, so include only redistributable files. Prefer an official-download-page-listed distribution with H.264/NVENC/AV1 support suitable for your users. ClipNest automatically discovers bundled tools; an existing valid custom FFmpeg path takes priority. This build recipe deliberately does not silently redistribute arbitrary tools from your PATH.
 

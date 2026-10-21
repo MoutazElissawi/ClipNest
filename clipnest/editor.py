@@ -12,12 +12,14 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QMessageBox, QSlider, QDoubleSpinBox, QComboBox, QTableWidget,
     QTableWidgetItem, QCheckBox, QProgressBar, QDialog, QFormLayout, QSpinBox,
-    QDialogButtonBox, QScrollArea, QSplitter, QInputDialog, QLayout, QSizePolicy)
+    QDialogButtonBox, QScrollArea, QSplitter, QInputDialog, QLayout, QSizePolicy, QGridLayout)
 
 from .config import DATA, atomic_json
-from .media import tools_path, probe, available_encoders, Edit, export_clip, ENCODERS, estimated_size, ExportETA
+from .media import (tools_path, probe, available_encoders, Edit, export_clip, ENCODERS, COPY, estimated_size, ExportETA, EncoderProbeCache,
+                    add_range, remove_range, keep_only_range)
 from .preview import VideoCanvas, Waveform
 from .editor_assets import waveform
+from .export_progress import ExportProgressBar
 
 
 class Job(QThread):
@@ -37,26 +39,31 @@ class Job(QThread):
             self.failed.emit(str(exc))
 
 
-from .desktop import DefaultAudioOutput, show_centered, ItemDelegate
+from .desktop import DefaultAudioOutput, show_centered, ItemDelegate, SeekSlider
 from .window_frame import DesktopWindow
+from .playback_lifecycle import PlaybackLifecycle
 
 
 class Editor(DesktopWindow):
+    exportCompleted = Signal(str)
+    exportFolderChanged = Signal()
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle('ClipNest • Clip editor')
         from .theme import apply_theme
         theme = getattr(parent, 'current_theme', parent.settings.get('ui_theme', 'dark')) if parent is not None and hasattr(parent, 'settings') else 'dark'
         apply_theme(self, theme, '\nQPushButton { padding: 6px 9px; }')
-        self.resize(1400, 900)
+        self.resize(1560, 1000)
         self.setMinimumSize(1000, 600)
         self.clips_folder = Path(parent.settings["output"]) if parent is not None and hasattr(parent, "settings") else Path.home()/"Videos/ClipNest"
         self.encoder_errors = {}
+        self.encoder_probe = EncoderProbeCache(lambda path: available_encoders(path))
         self.last_export_path = None
         self.info = None
         self.job = None
         self.analysis_jobs = []
         self.wave_token = 0
+        self.mutes = {}  # audio stream index -> muted (start, end) ranges, source seconds
         self.preview_temp = None
         self.crop = None
         self.colors = (0.0, 1.0, 1.0)
@@ -100,30 +107,40 @@ class Editor(DesktopWindow):
         self.caption = QLabel('Drop a completed clip onto the preview, or use Open / Browse clips.')
         self.caption.setObjectName('muted')
         self.caption.setWordWrap(True)
-        layout.addWidget(self.caption)
+        root_layout = layout
         split = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(split, 1)
         preview = QWidget()
         layout = QVBoxLayout(preview)
         layout.setContentsMargins(0, 0, 10, 0)
         split.addWidget(preview)
+        file_row = QHBoxLayout()
+        self.caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        file_row.addWidget(self.caption, 5)
+        self.open_clip_button = QPushButton('Open clip')
+        self.open_clip_button.clicked.connect(self.choose_clip)
+        self.browse_clips_button = QPushButton('Browse clips')
+        self.browse_clips_button.clicked.connect(self.browse_clips)
+        for button in (self.open_clip_button, self.browse_clips_button):
+            button.setMinimumWidth(140)
+            file_row.addWidget(button, 2)
+        file_row.addStretch(1)
+        layout.addLayout(file_row)
         sidebar = QWidget()
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(10, 0, 0, 0)
         side.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        side_scroll = QScrollArea()
-        side_scroll.setMinimumWidth(360)
-        side_scroll.setWidgetResizable(True)
-        side_scroll.setWidget(sidebar)
-        split.addWidget(side_scroll)
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        split.setSizes([840, 500])
+        sidebar.setMinimumWidth(490)
+        split.addWidget(sidebar)
+        split.setStretchFactor(0, 7)
+        split.setStretchFactor(1, 3)
+        split.setSizes([1020, 460])
         self.video = VideoCanvas()
         self.video.setMinimumHeight(180)
         self.video_sink = QVideoSink(self)
         self.video_sink.videoFrameChanged.connect(self.video.frame_changed)
         self.player.setVideoSink(self.video_sink)
+        self.playback_lifecycle = PlaybackLifecycle(self, self.player, self.video)
         self.video.clipDropped.connect(self.open_clip)
         layout.addWidget(self.video, 1)
         def icon_button(name, tooltip, callback, large=False):
@@ -150,6 +167,9 @@ class Editor(DesktopWindow):
             button.setToolTip(tooltip)
             button.clicked.connect(callback)
             transport.addWidget(button)
+        transport.addWidget(icon_button('jump-a', 'Go to A (selected start)', lambda: self.jump_marker(self.start.value())))
+        transport.addWidget(icon_button('jump-b', 'Go to B (selected end)', lambda: self.jump_marker(self.end.value())))
+        transport.addWidget(icon_button('crop', 'Drag crop corners', self.visual_crop))
         steps = QHBoxLayout()
         steps.setSpacing(8)
         for text, direction in [('−1 frame', -1), ('+1 frame', 1)]:
@@ -160,19 +180,20 @@ class Editor(DesktopWindow):
             button.setAccessibleName(button.toolTip())
             button.clicked.connect(lambda checked=False, d=direction: self.step_frame(d))
             steps.addWidget(button)
+        transport.addLayout(steps)
         selection = QPushButton('Play selection')
         selection.clicked.connect(self.play_selection)
         transport.addWidget(selection)
         transport.addStretch()
         self.clock = QLabel('0.0 / 0.0 s')
-        transport.addWidget(self.clock)
+        preview_options_clock = self.clock
         preview_options = QHBoxLayout()
         self.show_edits = QCheckBox('Show crop / colors live')
         self.show_edits.setChecked(True)
         self.show_edits.toggled.connect(self.update_preview)
         preview_options.addWidget(self.show_edits)
-        preview_options.addLayout(steps)
         preview_options.addStretch()
+        preview_options.addWidget(preview_options_clock)
         self.speed = QComboBox()
         self.speed.addItems(['0.25×', '0.5×', '1×', '1.5×', '2×'])
         self.speed.setCurrentIndex(2)
@@ -183,8 +204,28 @@ class Editor(DesktopWindow):
         layout.addLayout(transport)
         self.wave = Waveform()
         self.wave.seek.connect(lambda ms: self.jump_marker(ms/1000))
+        self.wave.region_changed.connect(self.region_changed)
         layout.addWidget(self.wave)
-        self.scrub = QSlider(Qt.Orientation.Horizontal)
+        # Per-track audio edits: silence parts of the track shown in the waveform.
+        region_row = QHBoxLayout()
+        self.region_label = QLabel('Track audio: Shift+drag the waveform to select a range')
+        self.region_label.setObjectName('muted')
+        self.region_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        region_row.addWidget(self.region_label, 1)
+        self.region_buttons = []
+        for text, tip, callback, needs_region in (
+                ('Use A–B', 'Select the Start–End export range on the waveform', self.region_from_markers, False),
+                ('Mute', 'Silence the selected range on this track (cut it out of this track only)', self.mute_region, True),
+                ('Keep only', 'Trim this track: silence everything outside the selected range', self.keep_region, True),
+                ('Unmute', 'Restore audio in the selected range on this track', self.unmute_region, True),
+                ('Clear', 'Remove all muted ranges from this track', self.clear_track_mutes, False)):
+            button = QPushButton(text)
+            button.setToolTip(tip)
+            button.clicked.connect(callback)
+            region_row.addWidget(button)
+            self.region_buttons.append((button, needs_region))
+        layout.addLayout(region_row)
+        self.scrub = SeekSlider(Qt.Orientation.Horizontal)
         self.scrub.setRange(0, 0)
         self.scrub.sliderMoved.connect(self.player.setPosition)
         layout.addWidget(self.scrub)
@@ -196,15 +237,9 @@ class Editor(DesktopWindow):
         row.addWidget(self.start)
         row.addWidget(QLabel('End'))
         row.addWidget(self.end)
-        layout.addLayout(row)
-        row = QHBoxLayout()
-        for label, callback in [('Open clip…', self.choose_clip), ('Browse clips…', self.browse_clips)]:
-            button = QPushButton(label)
-            button.clicked.connect(callback)
-            row.addWidget(button)
-        row.addWidget(icon_button('jump-a', 'Go to A (selected start)', lambda: self.jump_marker(self.start.value())))
-        row.addWidget(icon_button('jump-b', 'Go to B (selected end)', lambda: self.jump_marker(self.end.value())))
-        row.addWidget(icon_button('crop', 'Drag crop corners', self.visual_crop))
+        self.start.setFixedWidth(125)
+        self.end.setFixedWidth(125)
+        row.addStretch()
         layout.addLayout(row)
         self.selection_playing = False
         audio_heading = QLabel('AUDIO • Select tracks and adjust volume')
@@ -213,7 +248,7 @@ class Editor(DesktopWindow):
         self.tracks.setHorizontalHeaderLabels(['Keep', 'Audio track', 'Gain %', 'Listen'])
         self.tracks.horizontalHeader().setStretchLastSection(True)
         self.tracks.setColumnWidth(0, 55)
-        self.tracks.setColumnWidth(1, 185)
+        self.tracks.setColumnWidth(1, 175)
         self.tracks.setColumnWidth(2, 80)
         self.tracks.verticalHeader().setDefaultSectionSize(46)
         self.tracks.verticalHeader().setVisible(False)
@@ -227,6 +262,8 @@ class Editor(DesktopWindow):
         self.remix.toggled.connect(self.remix_changed)
         side.addWidget(self.remix)
         note = QLabel('Listen solo selects the waveform track. Combining excludes the existing Mix to avoid doubling.\nLive colors are approximate; Preview export checks final filters and audio. Solo volume is capped at 100%; export supports 200%.')
+        note.setToolTip(note.text())
+        note.setText('Listen solo previews a track and shows it on the waveform; Shift+drag there to mute or keep parts of it.')
         note.setWordWrap(True)
         note.setStyleSheet("font-size: 11px; color: #bfbfbf;")
         side.addWidget(note)
@@ -236,8 +273,14 @@ class Editor(DesktopWindow):
         side.addSpacing(4)
         side.addWidget(QLabel("EXPORT"))
         form = QFormLayout()
-        row = QHBoxLayout()
         self.encoder = QComboBox()
+        self.export_format = QComboBox()
+        for label, extension in [('MKV · video', 'mkv'), ('MP4 · video', 'mp4'), ('MP3 · audio', 'mp3'), ('M4A · audio', 'm4a'), ('WAV · uncompressed audio', 'wav'), ('FLAC · lossless audio', 'flac')]:
+            self.export_format.addItem(label, extension)
+        self.export_format.setCurrentIndex(max(0, self.export_format.findData(self.prefs.get('export_format', 'mkv'))))
+        form.addRow('Export format', self.export_format)
+        self.export_format.setToolTip('MP4 with H.264 is widely compatible for sharing. Audio formats export one selected track or a combined mix.')
+        self.export_format.currentIndexChanged.connect(self.export_format_changed)
         self.bitrate = QSpinBox()
         self.bitrate.setRange(1000, 200000)
         self.bitrate.setValue(self.export_choice['bitrate'] if self.export_choice else 20000)
@@ -252,46 +295,70 @@ class Editor(DesktopWindow):
         self.delete_preset.clicked.connect(self.delete_export_preset)
         preset_buttons.addWidget(self.delete_preset)
         form.addRow(preset_buttons)
-        form.addRow('Encoder', self.encoder)
-        form.addRow('Bitrate', self.bitrate)
+        compact = QGridLayout()
+        compact.setHorizontalSpacing(8)
+        compact.addWidget(QLabel('Encoder'), 0, 0)
+        compact.addWidget(self.encoder, 0, 1)
+        compact.addWidget(QLabel('Bitrate'), 0, 2)
+        compact.addWidget(self.bitrate, 0, 3)
+        self.encoder.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.encoder.setMinimumContentsLength(10)
+        compact.setColumnStretch(1, 1)
+        compact.setColumnStretch(3, 1)
         self.resolution = QComboBox()
-        for label, value in [('Source / crop size', None), ('1920 × 1080 (fit)', [1920,1080]), ('1280 × 720 (fit)', [1280,720]), ('1080 × 1920 (vertical fit)', [1080,1920])]:
+        for label, value in [('Source / crop size', None), ('3840 × 2160 (4K fit)', [3840,2160]), ('2560 × 1440 (1440p fit)', [2560,1440]), ('1920 × 1080 (fit)', [1920,1080]), ('1280 × 720 (fit)', [1280,720]), ('1080 × 1920 (vertical fit)', [1080,1920])]:
             self.resolution.addItem(label, value)
         self.export_fps = QComboBox()
         for label, value in [('Source FPS', 0), ('24 FPS', 24), ('30 FPS', 30), ('60 FPS', 60)]:
             self.export_fps.addItem(label, value)
+        self.upscale = QCheckBox('Allow upscaling smaller footage (Lanczos)')
+        self.upscale.setChecked(False)
+        self.upscale.setToolTip('Off by default. When off, smaller footage is padded without enlarging it. Upscaling enlarges pixels; it does not recover missing detail.')
         self.set_output_choice(self.export_choice or {})
-        form.addRow('Resolution', self.resolution)
-        form.addRow('Framerate', self.export_fps)
+        compact.addWidget(QLabel('Resolution'), 1, 0)
+        compact.addWidget(self.resolution, 1, 1)
+        compact.addWidget(QLabel('FPS'), 1, 2)
+        compact.addWidget(self.export_fps, 1, 3)
+        self.resolution.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.resolution.setMinimumContentsLength(14)
+        form.addRow(compact)
+        form.addRow(self.upscale)
         self.size_estimate = QLabel('Estimated size: open a clip')
         self.size_estimate.setWordWrap(True)
         form.addRow(self.size_estimate)
         side.addLayout(form)
         self.export_button = QPushButton('Export…')
         self.export_button.setObjectName('primary')
+        self.export_button.setMinimumWidth(140)
         self.export_button.clicked.connect(self.export)
-        row.addWidget(self.export_button)
+        export_actions = QHBoxLayout()
+        export_actions.addWidget(self.export_button, 1)
         self.cancel_button = QPushButton('Cancel export')
+        self.cancel_button.setMinimumWidth(140)
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_export)
-        row.addWidget(self.cancel_button)
-        side.addLayout(row)
-        self.progress = QProgressBar()
+        export_actions.addWidget(self.cancel_button, 1)
+        side.addLayout(export_actions)
+        footer = QVBoxLayout()
+        self.progress = ExportProgressBar()
+        self.progress.setObjectName('exportProgress')
+        self.progress.setStyleSheet("QProgressBar#exportProgress { min-height: 30px; max-height: 30px; }")
+        self.progress.setFixedHeight(30)
+        self.progress.setFormat('%p%')
         side.addWidget(self.progress)
         self.eta = ExportETA()
         self.eta_label = QLabel()
+        self.eta_label.setWordWrap(True)
         side.addWidget(self.eta_label)
         self.status = QLabel('FFmpeg tools are required for inspection and export. File → FFmpeg folder to configure.')
         self.status.setWordWrap(True)
-        side.addWidget(self.status)
+        footer.addWidget(self.status)
         side.addStretch()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(root)
-        self.setCentralWidget(scroll)
+        root_layout.addLayout(footer)
+        self.setCentralWidget(root)
         file_menu = self.menuBar().addMenu('File')
-        file_menu.addAction('Open clip…', self.choose_clip)
-        file_menu.addAction('Browse clips…', self.browse_clips)
+        file_menu.addAction('Open clip', self.choose_clip)
+        file_menu.addAction('Browse clips', self.browse_clips)
         file_menu.addAction('Export…', self.export)
         file_menu.addAction('FFmpeg folder…', self.choose_tools)
         file_menu.addAction('Check encoders again', self.check_encoders)
@@ -321,6 +388,15 @@ class Editor(DesktopWindow):
         self.resolution.currentIndexChanged.connect(self.export_controls_changed)
         self.export_fps.currentIndexChanged.connect(self.export_controls_changed)
         self.remix.toggled.connect(self.update_size_estimate)
+        self.upscale.toggled.connect(self.update_size_estimate)
+        self.export_format_changed()
+        self.update_region_controls()
+
+    def preferred_open_size(self):
+        # Include the real theme/font/titlebar layout rather than a fixed height.
+        self.ensurePolished()
+        self.layout().activate()
+        return self.size().expandedTo(self.sizeHint()).expandedTo(QSize(1560, 1000))
 
     def set_output_choice(self, choice):
         for widget, key, default in ((self.resolution, 'resolution', None), (self.export_fps, 'fps', 0)):
@@ -337,9 +413,13 @@ class Editor(DesktopWindow):
         return choice
 
     def update_size_estimate(self, *_):
+        if hasattr(self, 'size_estimate') and self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac'):
+            self.size_estimate.setText('Audio only · select one track or combine isolated tracks. MP3/M4A: 192 kb/s.')
+            return
         if hasattr(self, 'size_estimate') and self.info and hasattr(self, 'track_rows'):
-            estimate = estimated_size(self.current_edit()) / 1_000_000
-            self.size_estimate.setText(f'Estimated size: {estimate:.1f} MB · bitrate target; actual size varies with content and container overhead.')
+            estimate = estimated_size(self.current_edit(), self.info) / 1_000_000
+            note = ' · copy: starts at the keyframe before Start' if self.copy_selected() else ''
+            self.size_estimate.setText(f'Estimated size: {estimate:.1f} MB (approximate){note}')
 
     def export_progress(self, percent):
         self.progress.setValue(percent)
@@ -401,6 +481,8 @@ class Editor(DesktopWindow):
             return
         self.wave_row = row
         info, index, title = self.info, self.track_rows[row][0], self.track_rows[row][1]
+        self.wave.muted = self.mutes.get(index, [])
+        self.update_region_controls()
         self.wave.label = 'Loading waveform: ' + title
         self.wave.update()
         try:
@@ -430,7 +512,79 @@ class Editor(DesktopWindow):
     def current_edit(self):
         audio = [(index, title, volume.value()/100) for index, title, check, volume, _ in self.track_rows if check.isChecked()]
         return Edit(self.start.value(), self.end.value(), self.encoder.currentData(), self.bitrate.value(),
-                    audio, self.crop, *self.colors, remix=self.remix.isChecked(), resolution=self.resolution.currentData(), fps=self.export_fps.currentData())
+                    audio, self.crop, *self.colors, remix=self.remix.isChecked(), resolution=self.resolution.currentData(), fps=self.export_fps.currentData(), upscale=self.upscale.isChecked(),
+                    mutes={index: list(ranges) for index, ranges in self.mutes.items() if ranges})
+
+    def region_changed(self, region):
+        self.update_region_controls()
+
+    def wave_track(self):
+        if self.wave_row is None or not self.info or self.wave_row >= len(self.track_rows):
+            return None
+        return self.track_rows[self.wave_row]
+
+    def update_region_controls(self):
+        track, region = self.wave_track(), self.wave.region
+        for button, needs_region in self.region_buttons:
+            button.setEnabled(track is not None and (region is not None or not needs_region))
+        if track is None:
+            self.region_label.setText('Track audio: open a clip to edit individual tracks')
+            return
+        muted = self.mutes.get(track[0], [])
+        summary = f' • {len(muted)} muted part{"s" if len(muted) != 1 else ""}' if muted else ''
+        if region:
+            self.region_label.setText(f'{track[1]}: {region[0]:.3f}–{region[1]:.3f} s selected{summary}')
+        else:
+            self.region_label.setText(f'{track[1]}: Shift+drag the waveform to select a range{summary}')
+
+    def set_track_mutes(self, ranges):
+        track = self.wave_track()
+        if track is None:
+            return
+        index = track[0]
+        if ranges:
+            self.mutes[index] = ranges
+        else:
+            self.mutes.pop(index, None)
+        self.wave.muted = self.mutes.get(index, [])
+        row = self.wave_row
+        item = self.tracks.item(row, 1)
+        if item is not None:
+            base = item.text().split(' • muted ', 1)[0]
+            count = len(self.mutes.get(index, []))
+            item.setText(base + (f' • muted {count}×' if count else ''))
+        self.update_region_controls()
+        self.wave.update()
+        self.apply_listen_mutes(self.player.position())
+
+    def region_from_markers(self):
+        self.wave.set_region((self.start.value(), self.end.value()))
+
+    def mute_region(self):
+        track, region = self.wave_track(), self.wave.region
+        if track and region:
+            self.set_track_mutes(add_range(self.mutes.get(track[0], []), *region, self.info['duration']))
+
+    def keep_region(self):
+        track, region = self.wave_track(), self.wave.region
+        if track and region:
+            self.set_track_mutes(keep_only_range(*region, self.info['duration']))
+
+    def unmute_region(self):
+        track, region = self.wave_track(), self.wave.region
+        if track and region:
+            self.set_track_mutes(remove_range(self.mutes.get(track[0], []), *region))
+
+    def clear_track_mutes(self):
+        self.set_track_mutes([])
+
+    def apply_listen_mutes(self, position):
+        """Solo listening follows the muted ranges of the track being heard."""
+        if not self.info or self.listen_row >= len(self.track_rows):
+            return
+        seconds = position / 1000
+        ranges = self.mutes.get(self.track_rows[self.listen_row][0], [])
+        self.audio_output.setMuted(any(a <= seconds < b for a, b in ranges))
 
     def preview_export(self):
         if self.busy() or not self.info:
@@ -463,6 +617,7 @@ class Editor(DesktopWindow):
         output = DefaultAudioOutput(dialog)
         player.setAudioOutput(output)
         player.setVideoOutput(video)
+        dialog.playback_lifecycle = PlaybackLifecycle(dialog, player)
         player.setSource(QUrl.fromLocalFile(path))
         audio = QComboBox()
         audio.currentIndexChanged.connect(player.setActiveAudioTrack)
@@ -473,7 +628,7 @@ class Editor(DesktopWindow):
                 audio.addItem(str(track.value(QMediaMetaData.Key.Title) or f'Audio {i+1}'))
         player.tracksChanged.connect(tracks)
         layout.addWidget(audio)
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = SeekSlider(Qt.Orientation.Horizontal)
         player.durationChanged.connect(lambda duration: slider.setRange(0, duration))
         player.positionChanged.connect(lambda position: slider.setValue(position) if not slider.isSliderDown() else None)
         slider.sliderMoved.connect(player.setPosition)
@@ -490,9 +645,9 @@ class Editor(DesktopWindow):
 
     @staticmethod
     def valid_choice(choice):
-        return (isinstance(choice, dict) and isinstance(choice.get('encoder'), str) and choice.get('encoder') in ENCODERS
+        return (isinstance(choice, dict) and isinstance(choice.get('encoder'), str) and choice.get('encoder') in (*ENCODERS, COPY)
                 and type(choice.get('bitrate')) is int and 1000 <= choice['bitrate'] <= 200000
-                and choice.get('resolution') in (None, [1920,1080], [1280,720], [1080,1920])
+                and choice.get('resolution') in (None, [1920,1080], [1280,720], [1080,1920], [2560,1440], [3840,2160])
                 and choice.get('fps', 0) in (0,24,30,60))
 
     def refresh_presets(self):
@@ -510,7 +665,36 @@ class Editor(DesktopWindow):
         self.delete_preset.setEnabled(self.preset.currentData() in self.prefs['export_presets'])
 
     def export_ready(self):
-        return self.info is not None and self.encoder.currentData() in self.available_export_encoders and not self.busy()
+        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        return self.info is not None and (audio or self.encoder.currentData() in self.available_export_encoders) and not self.busy()
+
+    def export_format_changed(self, *_):
+        self.prefs['export_format'] = self.export_format.currentData()
+        self.save_prefs()
+        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        for control in (self.encoder, self.bitrate, self.resolution, self.export_fps, self.upscale):
+            control.setEnabled(not audio)
+        self.update_copy_controls()
+        self.export_button.setEnabled(self.export_ready())
+        self.update_size_estimate()
+
+    def copy_selected(self):
+        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        return not audio and self.encoder.currentData() == COPY
+
+    def update_copy_controls(self):
+        """Copy passes video through untouched, so video-processing options do not apply."""
+        if not hasattr(self, 'upscale'):
+            return
+        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        copy = self.copy_selected()
+        for control in (self.bitrate, self.resolution, self.export_fps, self.upscale):
+            control.setEnabled(not audio and not copy)
+        if copy:
+            self.encoder.setToolTip('Copy: no re-encoding. Video is passed through unchanged and starts at the keyframe '
+                                    'before Start. Audio tracks are copied unless you changed their volume, muted parts '
+                                    'or combined them; those are re-encoded as AAC. Crop, colors, resolution and FPS '
+                                    'cannot be applied.')
 
     def populate_export_encoders(self):
         desired = self.export_choice['encoder'] if self.export_choice else None
@@ -533,8 +717,9 @@ class Editor(DesktopWindow):
 
     def export_controls_changed(self, *_):
         label = self.encoder.currentData()
-        if label not in ENCODERS:
+        if label not in ENCODERS and label != COPY:
             return
+        self.update_copy_controls()
         self.export_choice = self.output_choice(label)
         self.update_size_estimate()
         self.prefs['last_export'] = dict(self.export_choice)
@@ -568,7 +753,7 @@ class Editor(DesktopWindow):
 
     def save_export_preset(self):
         label = self.encoder.currentData()
-        if label not in ENCODERS:
+        if label not in ENCODERS and label != COPY:
             self.error('Load a clip or check encoders before saving a preset.')
             return
         name, ok = QInputDialog.getText(self, 'Save export preset', 'Preset name:', text=self.preset.currentData() or '')
@@ -617,6 +802,7 @@ class Editor(DesktopWindow):
             self.prefs['export_folder'] = folder
             self.save_prefs()
             self.status.setText('Default export folder: ' + folder)
+            self.exportFolderChanged.emit()
 
     def encoder_diagnostics(self):
         try:
@@ -714,10 +900,10 @@ class Editor(DesktopWindow):
         self.status.setText(text)
         QMessageBox.warning(self, 'Clip editor', text)
 
-    def choose_tools(self):
+    def choose_tools(self, checked=False, *, dialog_parent=None):
         if self.busy():
             return
-        folder = QFileDialog.getExistingDirectory(self, 'Folder containing ffmpeg.exe and ffprobe.exe')
+        folder = QFileDialog.getExistingDirectory(dialog_parent or self, 'Folder containing ffmpeg.exe and ffprobe.exe')
         if folder:
             try:
                 tools_path(folder)
@@ -736,13 +922,15 @@ class Editor(DesktopWindow):
             self.error(str(exc))
             return
         self.status.setText('Testing encoders with two frames each…')
-        self.launch(lambda job: available_encoders(ffmpeg), self.encoders_checked)
+        self.launch(lambda job: self.encoder_probe.get(ffmpeg, force=True), self.encoders_checked)
 
     def encoders_checked(self, result):
         labels, errors = result
         self.encoder_errors = errors
-        self.available_export_encoders = labels
+        # Copy needs no encoder, so it is always available.
+        self.available_export_encoders = list(labels) + [COPY]
         self.populate_export_encoders()
+        self.update_copy_controls()
         self.encoder.setToolTip('\n\n'.join(f'{k}: {v}' for k, v in errors.items()))
         message = 'Available: ' + (', '.join(labels) or 'none') + ('. Unavailable: ' + ', '.join(errors) + '. File → Encoder diagnostics for details.' if errors else '')
         if self.export_choice and self.export_choice['encoder'] not in labels:
@@ -768,10 +956,14 @@ class Editor(DesktopWindow):
             return
         self.player.pause()
         self.status.setText('Inspecting clip and checking encoders…')
-        self.launch(lambda job: (probe(path, ffprobe), available_encoders(ffmpeg)), self.loaded)
+        self.launch(lambda job: (probe(path, ffprobe), self.encoder_probe.get(ffmpeg)), self.loaded)
 
     def loaded(self, result):
         self.last_export_path = None
+        # A finished bar belongs to the previous clip; 100% here looked like this clip was exported.
+        self.progress.setValue(0)
+        self.eta.reset()
+        self.eta_label.clear()
         self.info, encoders = result
         self.encoders_checked(encoders)
         self.crop, self.colors = None, (0., 1., 1.)
@@ -786,6 +978,9 @@ class Editor(DesktopWindow):
         self.scrub.setRange(0, round(self.info['duration'] * 1000))
         self.position_changed(0)
         self.track_rows = []
+        self.mutes = {}
+        self.wave.muted = []
+        self.wave.set_region(None)
         self.tracks.setRowCount(len(self.info['audio']))
         for i, stream in enumerate(self.info['audio']):
             title = stream.get('tags', {}).get('title', f'Audio {i+1}')
@@ -825,6 +1020,7 @@ class Editor(DesktopWindow):
             return
         self.listen_row = row
         self.player.setActiveAudioTrack(row)
+        self.apply_listen_mutes(self.player.position())
         for i, (_, _, _, _, button) in enumerate(self.track_rows):
             button.setText('Listening' if i == row else 'Listen solo')
         self.update_listen_volume()
@@ -836,6 +1032,7 @@ class Editor(DesktopWindow):
             self.audio_output.setVolume(min(1.0, self.track_rows[self.listen_row][3].value() / 100))
 
     def position_changed(self, position):
+        self.apply_listen_mutes(position)
         self.wave.position = position
         self.wave.update()
         if not self.scrub.isSliderDown():
@@ -947,11 +1144,13 @@ class Editor(DesktopWindow):
             return
         edit = self.current_edit()
         source = Path(self.info['path'])
-        suggested = self.last_export_path or str(Path(self.prefs.get('export_folder') or source.parent) / (source.stem + '_edited.mkv'))
-        path, _ = QFileDialog.getSaveFileName(self, 'Export clip', suggested, 'MKV (*.mkv);;MP4 (*.mp4)',
+        extension = self.export_format.currentData()
+        suggested = str(Path(self.last_export_path or str(Path(self.prefs.get('export_folder') or self.clips_folder/'Exports') / (source.stem + '_edited.mkv'))).with_suffix('.' + extension))
+        path, _ = QFileDialog.getSaveFileName(self, 'Export clip', suggested, f'{extension.upper()} (*.{extension})',
                                              options=QFileDialog.Option.DontConfirmOverwrite)
         if not path:
             return
+        path = str(Path(path).with_suffix('.' + extension))
         try:
             ffmpeg, _ = tools_path(self.prefs.get('ffmpeg_folder', ''))
             from .media import export_args, file_identity
@@ -976,6 +1175,19 @@ class Editor(DesktopWindow):
     def export_saved(self, path):
         self.last_export_path = path
         self.status.setText('Export saved: ' + path)
+        from .exports import register_export
+        try:
+            register_export(path)
+        except OSError:
+            self.status.setText('Export saved, but its gallery entry could not be stored: ' + path)
+        self.exportCompleted.emit(path)
+        parent = self.parent()
+        if parent is not None and hasattr(parent, 'capture_notice'):
+            parent.capture_notice(dict(title='Export complete', detail=Path(path).name, sound=True))
+        else:
+            from .notifications import export_beep
+            export_beep()
+            QMessageBox.information(self, 'Export complete', 'Saved: ' + path)
 
     def cancel_export(self):
         if self.job:

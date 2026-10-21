@@ -20,9 +20,9 @@ def linked(path):
         return True
 
 
-def clip_key(path):
+def clip_key(path, st=None):
     path = Path(path)
-    st = path.stat()
+    st = st or path.stat()
     # Filesystem identity survives same-volume rename/move. Size/mtime guard
     # against reused file IDs. Cross-volume copies are intentionally new clips.
     if st.st_ino:
@@ -56,12 +56,38 @@ class Annotations:
                     clip.update(tags=[], favorite=False)
         return clips
 
+    def load_all(self):
+        """identity -> (tags, favorite), read once so a library scan can filter every file."""
+        with self.connect() as db:
+            rows = db.execute('SELECT identity, tags, favorite FROM clips').fetchall()
+        result = {}
+        for identity, tags, favorite in rows:
+            try:
+                result[identity] = (json.loads(tags), bool(favorite))
+            except ValueError:
+                result[identity] = ([], bool(favorite))
+        return result
+
     def set(self, path, tags=None, favorite=None):
         key = clip_key(path)
         with self.connect() as db:
             old = db.execute('SELECT tags, favorite FROM clips WHERE identity=?', (key,)).fetchone() or ('[]', 0)
             tags = json.dumps(list(dict.fromkeys(t.strip()[:80] for t in tags if t.strip()))[:30]) if tags is not None else old[0]
             db.execute('INSERT OR REPLACE INTO clips VALUES (?, ?, ?)', (key, tags, int(favorite) if favorite is not None else old[1]))
+
+
+def library_filter(query, favorites, annotations):
+    """Predicate for a full-library scan; None when nothing is filtered."""
+    if not query.strip() and not favorites:
+        return None
+    def accept(path, stat, clip):
+        try:
+            tags, favorite = annotations.get(clip_key(path, stat), ([], False))
+        except OSError:
+            tags, favorite = [], False
+        clip.update(tags=tags, favorite=favorite)
+        return matches(clip, query, favorites)
+    return accept
 
 
 def matches(clip, query='', favorites=False):

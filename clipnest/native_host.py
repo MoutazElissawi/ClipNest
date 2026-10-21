@@ -15,6 +15,9 @@ from .config import DATA, ENGINE, ENCODERS, validate
 from .libobs import LibObs, VideoInfo, AudioInfo, Vec2, SIGNAL, METER, P, utf8, obs_path, decode
 
 
+OBS_ORDER_MOVE_BOTTOM = 3  # enum obs_order_movement
+
+
 class NativeEngine:
     def __init__(self, emit):
         self.emit = emit
@@ -23,7 +26,11 @@ class NativeEngine:
         self.scene = None
         self.inputs, self.items, self.outputs = {}, {}, {}
         self.encoders, self.callbacks, self.meters = [], [], []
+        self.ui_tasks = None
         self.source_meters = {}
+        self.input_settings = {}
+        self.screen_transform = None
+        self.screen_transforms = {}
         self.stop_events, self.stop_codes = {}, {}
         self.stopping = set()
         self.record_path = self.last_replay = ""
@@ -38,7 +45,8 @@ class NativeEngine:
     def initialize(self, settings):
         validate(settings)
         self.settings = settings
-        self.capture_method = settings.get("capture_method", 2)
+        self.capture_method = settings.get("window_method" if settings.get("capture_target") == "window" else "capture_method", 2)
+        print(f"Capture target: {settings.get('capture_target', 'display')}; method: {self.capture_method}; window: {settings.get('window_value', '')}", file=sys.stderr, flush=True)
         if os.name == "nt":
             user32 = C.WinDLL("user32", use_last_error=True)
             user32.SetProcessDpiAwarenessContext.argtypes = [P]
@@ -59,9 +67,14 @@ class NativeEngine:
         if not l.obs_startup(b"en-US", obs_path(config_dir), None):
             raise RuntimeError("libobs initialization failed. See native-engine.log.")
         self.started = True
+        from .native_tasks import NativeTasks
+        self.ui_tasks = NativeTasks()
+        l.obs_set_ui_task_handler(self.ui_tasks.callback)
         l.obs_add_data_path(obs_path(ENGINE / "data/libobs"))
         graphics = obs_path(ENGINE / "bin/64bit/libobs-d3d11.dll")
-        video = VideoInfo(graphics, settings["fps"], 1, settings["width"], settings["height"],
+        # Stitched displays render on a full-size base canvas and encode a scaled output.
+        video = VideoInfo(graphics, settings["fps"], 1, settings.get("base_width", settings["width"]),
+                          settings.get("base_height", settings["height"]),
                           settings["width"], settings["height"], 2, 0, True, 2, 1, 2)
         result = l.obs_reset_video(C.byref(video))
         if result != 0:
@@ -99,17 +112,57 @@ class NativeEngine:
             time.sleep(.05)
         return False
 
+    def refresh_idle_screen(self):
+        """New capture clients for a new session; never disturb shared live output."""
+        if self.capture_attached or self.active('record') or self.active('replay'):
+            return
+        names = [n for n in self.input_settings if n == 'CN Screen' or n.startswith('CN Screen ')]
+        for name in names:
+            self.refresh_screen(name)
+
+    def refresh_screen(self, name):
+        old, kind = self.inputs[name]
+        with self.lib.data(self.input_settings[name]) as data:
+            source = self.lib.obs_source_create(utf8(kind), utf8(name + ' reconnecting'), data, None)
+        if not source:
+            raise RuntimeError('Could not reconnect the screen source; recording was not started.')
+        item = self.lib.obs_scene_add(self.scene, source)
+        if not item:
+            self.lib.obs_source_release(source)
+            raise RuntimeError('Could not attach the reconnected screen source.')
+        # obs_scene_add puts the new item on top. Displays must stay underneath
+        # the game layer, or they cover the hooked game (VALORANT, beta.7-beta.9).
+        self.lib.obs_sceneitem_set_order(item, OBS_ORDER_MOVE_BOTTOM)
+        self.lib.obs_sceneitem_remove(self.items[name])
+        self.lib.obs_source_release(old)
+        self.lib.obs_source_set_name(source, utf8(name))
+        self.inputs[name], self.items[name] = (source, kind), item
+        transform = self.screen_transforms.get(name) or (self.screen_transform if name == 'CN Screen' else None)
+        if transform:
+            self.call('SetSceneItemTransform', dict(sceneItemId=name, sceneItemTransform=transform))
+
     def prepare_capture(self):
+        if self.settings.get("capture_target") in ("window", "game") and not self.settings.get("window_value"):
+            raise RuntimeError("Select a capture window in Settings before starting replay or recording.")
         if self.capture_attached:
+            if not self.capture_ready():
+                raise RuntimeError("The active capture source is unavailable. Reconnect capture before starting another output.")
             return
         if not self.scene:
             raise RuntimeError("Capture scene is missing. Reconnect the engine.")
+        self.refresh_idle_screen()
         self.lib.obs_set_output_source(0, self.lib.obs_scene_get_source(self.scene))
         self.capture_attached = True
         # Let the graphics thread activate the source before checking its size.
         time.sleep(.1)
-        if self.capture_ready():
+        if (self.capture_ready(timeout=10) if self.settings.get("capture_target") == "game" else self.capture_ready()):
             return
+        if self.settings.get("capture_target") in ("window", "game"):
+            raise RuntimeError("The selected game/window did not produce video. Restore the game and check that ClipNest and the game use the same privileges. For osu!, try Game capture or Window capture with BitBlt and osu! compatibility mode. Check native-engine.log for hook/capture errors. Recording was not started.")
+        if self.settings.get('capture_method') == 1:
+            self.lib.obs_set_output_source(0, None)
+            self.capture_attached = False
+            raise RuntimeError('DXGI Desktop Duplication is unavailable after the display change. Wait for the desktop to settle and restart replay. Your DXGI selection was preserved; Windows Graphics Capture was not enabled.')
         if self.capture_method != 2:
             self.emit("NativeNotice", {"message": "Desktop Duplication did not initialize. Trying Windows Graphics Capture; Windows 10 may show a yellow border."})
             with self.lib.data({"method": 2}) as data:
@@ -130,15 +183,8 @@ class NativeEngine:
         available = l.enumerate(l.obs_enum_encoder_types)
         if encoder_id not in available:
             raise RuntimeError(f"{s['encoder']} is unavailable. Stop replay and select another encoder in Settings.")
-        video_settings = {"rate_control": "CBR", "bitrate": s["bitrate"], "keyint_sec": 2,
-                          "profile": "main" if s["encoder"] == "NVIDIA AV1" else "high"}
-        if s['encoder'].startswith('CPU'):
-            video_settings['preset'] = 'veryfast'
-        else:
-            # OBS 32.2.2 obs-nvenc uses adaptive_quantization, not legacy psycho_aq.
-            video_settings.update(preset=s.get('nvenc_preset', 'p4'), tune='hq',
-                                  multipass='disabled', bf=2, lookahead=False,
-                                  adaptive_quantization=False)
+        from .encoding import video_encoder_settings
+        video_settings = video_encoder_settings(s)
         print(f'Video encoder settings: {video_settings}; one shared video encoder for replay + recording', file=sys.stderr, flush=True)
         with l.data(video_settings) as data:
             video = l.obs_video_encoder_create(utf8(encoder_id), b"ClipNest Video", data, None)
@@ -146,8 +192,10 @@ class NativeEngine:
         self.encoders.append(video)
         l.obs_encoder_set_video(video, l.obs_get_video())
         audio = []
-        for index, name in enumerate(("Mix", "Desktop", "Microphone")):
-            with l.data({"bitrate": 192}) as data:
+        from .config import app_track_name
+        names = ["Mix", "Desktop", "Microphone"] + ([app_track_name(s["app_audio"]) or "Application"] if s.get("app_audio") else [])
+        for index, name in enumerate(names):
+            with l.data({"bitrate": s.get('mic_bitrate' if name == 'Microphone' else 'audio_bitrate', 192)}) as data:
                 enc = l.obs_audio_encoder_create(b"ffmpeg_aac", utf8(name), data, index, None)
             if not enc: raise RuntimeError(f"Could not create AAC encoder for {name}.")
             self.encoders.append(enc)
@@ -256,9 +304,9 @@ class NativeEngine:
             raise
         if kind == "record": self.record_start = time.monotonic()
 
-    def properties(self, name, prop_name):
+    def properties(self, name, prop_name, *, kind=None):
         l = self.lib
-        properties = l.obs_source_properties(self.inputs[name][0])
+        properties = l.obs_get_source_properties(utf8(kind)) if kind else l.obs_source_properties(self.inputs[name][0])
         if not properties: raise RuntimeError(f"No properties for {name}.")
         try:
             prop = l.obs_properties_get(properties, utf8(prop_name))
@@ -371,14 +419,18 @@ class NativeEngine:
                 source = l.obs_source_create(utf8(a["inputKind"]), utf8(a["inputName"]), data, None)
             if not source: raise RuntimeError(f"Could not create {a['inputName']}.")
             self.inputs[a["inputName"]] = (source, a["inputKind"])
+            self.input_settings[a["inputName"]] = dict(a["inputSettings"])
             item = l.obs_scene_add(self.scene, source)
             if not item: raise RuntimeError("Could not add input to scene.")
             self.items[a["inputName"]] = item
+            if a.get("sceneItemEnabled") is False:
+                l.obs_sceneitem_set_visible(item, False)
             if a["inputKind"].startswith("wasapi"):
                 l.obs_source_set_muted(source, True)
                 self.attach_meter(source, a["inputName"])
-        elif method == "GetInputPropertiesListPropertyItems": return self.properties(a["inputName"], a["propertyName"])
+        elif method == "GetInputPropertiesListPropertyItems": return self.properties(a.get("inputName", a.get("inputKind")), a["propertyName"], kind=a.get("inputKind"))
         elif method == "SetInputSettings":
+            self.input_settings.setdefault(a["inputName"], {}).update(a["inputSettings"])
             with l.data(a["inputSettings"]) as data: l.obs_source_update(self.inputs[a["inputName"]][0], data)
         elif method == "SetInputMute": l.obs_source_set_muted(self.inputs[a["inputName"]][0], a["inputMuted"])
         elif method == "SetInputVolume": l.obs_source_set_volume(self.inputs[a["inputName"]][0], a["inputVolumeMul"])
@@ -387,8 +439,21 @@ class NativeEngine:
             l.obs_source_set_audio_mixers(self.inputs[a["inputName"]][0], mask)
         elif method == "SetInputAudioMonitorType": l.obs_source_set_monitoring_type(self.inputs[a["inputName"]][0], 0)
         elif method == "GetSceneItemId": return {"sceneItemId": a["sourceName"]}
+        elif method == "SetInputEnabled":
+            # Disabled sources are not drawn but keep ticking, so a game hook stays attached.
+            l.obs_source_set_enabled(self.inputs[a["inputName"]][0], bool(a["inputEnabled"]))
+        elif method == "GetGameLayerState":
+            source = self.inputs[a["inputName"]][0]
+            return dict(l.game_hook(source), size=[l.obs_source_get_width(source), l.obs_source_get_height(source)])
+        elif method == "SetSceneItemEnabled":
+            # A hidden game_capture source stops showing, so OBS releases its hook.
+            l.obs_sceneitem_set_visible(self.items[a["sceneItemId"]], bool(a["sceneItemEnabled"]))
         elif method == "SetSceneItemTransform":
             item, t = self.items[a["sceneItemId"]], a["sceneItemTransform"]
+            if a["sceneItemId"] == "CN Screen":
+                self.screen_transform = dict(t)
+            if a["sceneItemId"] == "CN Screen" or a["sceneItemId"].startswith("CN Screen "):
+                self.screen_transforms[a["sceneItemId"]] = dict(t)
             l.obs_sceneitem_set_pos(item, C.byref(Vec2(t["positionX"], t["positionY"])))
             l.obs_sceneitem_set_alignment(item, t["alignment"])
             l.obs_sceneitem_set_bounds_type(item, 2)
@@ -401,6 +466,9 @@ class NativeEngine:
             minutes, seconds = divmod(rem, 60)
             return {"outputActive": self.active("record"), "outputTimecode": f"{hours:02}:{minutes:02}:{seconds:02}",
                     "captureAttached": self.capture_attached, "captureMethod": self.capture_method,
+                    "sourceSize": [l.obs_source_get_width(self.inputs["CN Screen"][0]), l.obs_source_get_height(self.inputs["CN Screen"][0])],
+                    "gameLayerSize": ([l.obs_source_get_width(self.inputs["CN Game Layer"][0]), l.obs_source_get_height(self.inputs["CN Game Layer"][0])]
+                                      if "CN Game Layer" in self.inputs else None),
                     "stats": self.capture_stats()}
         elif method == "GetReplayBufferStatus": return {"outputActive": self.active("replay")}
         elif method == "StartRecord": self.start("record")
@@ -424,6 +492,9 @@ class NativeEngine:
         else: raise RuntimeError(f"Unknown native-engine method: {method}")
         return {}
 
+    def before_source_shutdown(self):
+        pass
+
     def shutdown(self):
         if not self.started:
             if self.com_initialized:
@@ -439,6 +510,18 @@ class NativeEngine:
                 errors.append(str(exc))
         if errors:
             raise RuntimeError("; ".join(errors))
+        # Files are closed. The controller now allows only a short teardown, and a
+        # hang (seen during Windows audio-device changes) dumps every thread's stack.
+        self.emit("OutputsFinalized", {})
+        faulthandler.dump_traceback_later(6, exit=False)
+        try:
+            self.release_native()
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    def release_native(self):
+        l = self.lib
+        self.before_source_shutdown()
         for handler, name, callback in self.callbacks: l.signal_handler_disconnect(handler, name, callback, None)
         for output in self.outputs.values(): l.obs_output_release(output)
         for enc in self.encoders: l.obs_encoder_release(enc)
@@ -446,9 +529,25 @@ class NativeEngine:
             l.obs_volmeter_remove_callback(meter, callback, None)
             l.obs_volmeter_destroy(meter)
         l.obs_set_output_source(0, None)
-        if self.scene: l.obs_scene_release(self.scene)
+        for item in self.items.values(): l.obs_sceneitem_remove(item)
+        self.items.clear()
+        if self.scene:
+            l.obs_scene_release(self.scene)
+            self.scene = None
         for source, _ in self.inputs.values(): l.obs_source_release(source)
+        self.inputs.clear()
+        # Source destructors must finish while plugin globals still exist.
+        l.obs_wait_for_destroy_queue()
+        if self.ui_tasks is not None:
+            self.ui_tasks.flush()
         l.obs_shutdown()
+        if self.ui_tasks is not None:
+            self.ui_tasks.close()
+            self.ui_tasks = None
+        self.outputs.clear()
+        self.encoders.clear()
+        self.callbacks.clear()
+        self.meters.clear()
         self.started = False
         if self.com_initialized:
             C.windll.ole32.CoUninitialize()

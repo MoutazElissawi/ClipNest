@@ -10,6 +10,16 @@ from PySide6.QtGui import QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import QApplication, QWidget
 
 
+def export_beep():
+    """Short, asynchronous system beep for a finished export."""
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_OK)
+    except (ImportError, RuntimeError):
+        from PySide6.QtWidgets import QApplication
+        QApplication.beep()
+
+
 class Toast(QWidget):
     def __init__(self):
         flags = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
@@ -109,7 +119,7 @@ class Notifications:
             return
         self.recent[key] = now
         item = (title, detail, tone)
-        if tone == 'error':
+        if tone in ('error', 'progress') or (self.active and self.toast.tone == 'progress'):
             # Failures take priority; a start confirmation must not follow a stop error.
             self.queue.clear()
             self.display(item)

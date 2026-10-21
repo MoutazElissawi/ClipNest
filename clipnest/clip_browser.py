@@ -66,6 +66,7 @@ class ClipBrowser(QDialog):
         layout.addLayout(row)
         row = QHBoxLayout()
         self.search = QLineEdit()
+        self.search.addAction(QIcon(str(Path(__file__).parent / "assets/ui-search.svg")), QLineEdit.ActionPosition.LeadingPosition)
         self.search.setPlaceholderText('Search game, name, YYYY-MM-DD or tag…')
         row.addWidget(self.search, 1)
         self.sort = QComboBox()
@@ -160,6 +161,8 @@ class ClipBrowser(QDialog):
         self.items.clear()
         for clip in filtered[:self.shown]:
             item = QListWidgetItem(f"{'★ ' if clip.get('favorite') else ''}{clip['name']}\n{clip['folder']} • {datetime.fromtimestamp(clip['modified']):%Y-%m-%d %H:%M} • {clip['size']/1048576:.1f} MB")
+            from .gallery import card_icon
+            item.setIcon(card_icon(clip))
             item.setData(Qt.ItemDataRole.UserRole, clip['path'])
             item.setToolTip(clip['path'] + '\nTags: ' + ', '.join(clip.get('tags', [])))
             item.setSizeHint(QSize(350, 100))
@@ -218,7 +221,11 @@ class ClipBrowser(QDialog):
 
     def thumbnail_ready(self, path, image):
         if path in self.items:
-            self.items[path].setIcon(QIcon(image))
+            from .gallery import card_icon
+            clip = next((c for c in self.clips if c["path"] == path), None)
+            if clip is not None:
+                clip["thumbnail"] = image
+                self.items[path].setIcon(card_icon(clip))
 
     def open_selected(self, *_):
         item = self.list.currentItem()

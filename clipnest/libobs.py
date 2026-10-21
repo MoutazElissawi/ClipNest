@@ -24,9 +24,11 @@ class CallData(C.Structure):
 
 SIGNAL = C.CFUNCTYPE(None, P, P)
 METER = C.CFUNCTYPE(None, P, C.POINTER(F), C.POINTER(F), C.POINTER(F))
+from .native_tasks import UI_HANDLER
 
 SIGNATURES = {
-    "obs_get_version_string": (S,), "obs_startup": (B, S, S, P), "obs_shutdown": (None,),
+    "obs_set_ui_task_handler": (None, UI_HANDLER),
+    "obs_wait_for_destroy_queue": (B,), "obs_get_version_string": (S,), "obs_startup": (B, S, S, P), "obs_shutdown": (None,),
     "obs_add_data_path": (None, S), "obs_reset_video": (I, C.POINTER(VideoInfo)),
     "obs_reset_audio": (B, C.POINTER(AudioInfo)),
     "obs_open_module": (I, C.POINTER(P), S, S), "obs_init_module": (B, P),
@@ -41,6 +43,7 @@ SIGNATURES = {
     "obs_source_get_width": (U, P), "obs_source_get_height": (U, P),
     "obs_source_set_volume": (None, P, F), "obs_source_set_audio_mixers": (None, P, U),
     "obs_source_set_monitoring_type": (None, P, I),
+    "obs_get_source_properties": (P, S),
     "obs_source_properties": (P, P), "obs_properties_destroy": (None, P),
     "obs_properties_get": (P, P, S), "obs_property_list_format": (I, P),
     "obs_property_list_item_count": (Z, P), "obs_property_list_item_name": (S, P, Z),
@@ -48,7 +51,8 @@ SIGNATURES = {
     "obs_property_list_item_disabled": (B, P, Z),
     "obs_sceneitem_set_pos": (None, P, C.POINTER(Vec2)), "obs_sceneitem_set_alignment": (None, P, U),
     "obs_sceneitem_set_bounds_type": (None, P, I), "obs_sceneitem_set_bounds_alignment": (None, P, U),
-    "obs_sceneitem_set_bounds": (None, P, C.POINTER(Vec2)),
+    "obs_sceneitem_set_bounds": (None, P, C.POINTER(Vec2)), "obs_sceneitem_set_visible": (None, P, B), "obs_sceneitem_set_order": (None, P, I),
+    "obs_source_set_enabled": (None, P, B), "obs_source_get_proc_handler": (P, P),
     "obs_video_encoder_create": (P, S, S, P, P), "obs_audio_encoder_create": (P, S, S, P, Z, P),
     "obs_encoder_release": (None, P), "obs_encoder_set_video": (None, P, P),
     "obs_encoder_set_audio": (None, P, P),
@@ -107,6 +111,23 @@ class LibObs:
             values.append(decode(result.value))
             index += 1
         return values
+
+    def game_hook(self, source):
+        """OBS game_capture's get_hooked procedure: hooked flag plus window identity."""
+        data = CallData()
+        try:
+            if not self.proc_handler_call(self.obs_source_get_proc_handler(source), b"get_hooked", C.byref(data)):
+                return {"hooked": False, "title": "", "class": "", "executable": ""}
+            hooked = C.c_bool()
+            self.calldata_get_data(C.byref(data), b"hooked", C.byref(hooked), C.sizeof(hooked))
+            result = {"hooked": bool(hooked.value)}
+            for key in ("title", "class", "executable"):
+                value = S()
+                self.calldata_get_string(C.byref(data), utf8(key), C.byref(value))
+                result[key] = decode(value.value)
+            return result
+        finally:
+            self.bfree(data.stack)
 
     def procedure(self, output, name, result_key=None):
         data = CallData()

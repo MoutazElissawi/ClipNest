@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "ClipNest green",
+  "colors": {
+    "background": "#101010",
+    "surface": "#181818",
+    "raised": "#272727",
+    "border": "#3b3b3b",
+    "text": "#eeeeee",
+    "muted": "#aaaaaa",
+    "accent": "#76b900",
+    "accent_hover": "#8ed000",
+    "accent_text": "#101500",
+    "selection": "#253018",
+    "danger": "#a92b35",
+    "danger_hover": "#c23642"
+  }
+}

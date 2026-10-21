@@ -3,6 +3,7 @@ import ctypes
 from ctypes import wintypes
 import os
 import logging
+import time
 from PySide6.QtCore import QObject, QTimer
 from PySide6.QtWidgets import QApplication
 from PySide6.QtMultimedia import QMediaDevices
@@ -21,12 +22,18 @@ class SystemEvents(QObject):
         self.audio_timer = QTimer(window)
         self.audio_timer.setSingleShot(True)
         self.audio_timer.setInterval(1200)
-        self.audio_timer.timeout.connect(lambda: self.submit('audio_devices_changed'))
+        self.audio_timer.timeout.connect(self.audio_changed)
         self.devices = QMediaDevices(window)
+        self.audio_snapshot = self.audio_signature()
         self.devices.audioOutputsChanged.connect(self.audio_timer.start)
         self.devices.audioInputsChanged.connect(self.audio_timer.start)
         self.hwnd = None
         self.closed = False
+        self.last_heartbeat = time.monotonic()
+        self.heartbeat_timer = QTimer(window)
+        self.heartbeat_timer.setInterval(2000)
+        self.heartbeat_timer.timeout.connect(self.heartbeat)
+        self.heartbeat_timer.start()
         self.wts = None
         self.registration_timer = QTimer(window)
         self.registration_timer.setSingleShot(True)
@@ -56,9 +63,33 @@ class SystemEvents(QObject):
         except (OSError, AttributeError):
             logging.getLogger('clipnest').exception('Session notifications unavailable')
 
+    @staticmethod
+    def audio_signature():
+        def devices(items):
+            return tuple(sorted((bytes(d.id()), d.isDefault()) for d in items))
+        return (devices(QMediaDevices.audioInputs()), devices(QMediaDevices.audioOutputs()))
+
+    def audio_changed(self):
+        if self.closed or self.asleep or self.locked:
+            return
+        signature = self.audio_signature()
+        if signature == self.audio_snapshot:
+            return
+        previous, self.audio_snapshot = self.audio_snapshot, signature
+        self.submit('audio_devices_changed', {'inputs': signature[0] != previous[0], 'outputs': signature[1] != previous[1]})
+
     def handle_message(self, hwnd, message, value):
         if not self.closed and self.hwnd is not None and hwnd == self.hwnd:
             self.dispatch(message, value)
+
+    def heartbeat(self):
+        now = time.monotonic()
+        gap, self.last_heartbeat = now-self.last_heartbeat, now
+        # Modern standby/driver changes can miss a power broadcast. This detects
+        # a suspended GUI, not a motionless/black game frame or silent microphone.
+        if not self.closed and gap > 15:
+            self.asleep = False  # a running timer after the pause proves the system is awake
+            self.queue_resume('Capture reconnected after a long system pause')
 
     def queue_resume(self, reason):
         self.reason = reason
@@ -67,6 +98,9 @@ class SystemEvents(QObject):
 
     def resume(self):
         if not self.locked and not self.asleep:
+            self.audio_timer.stop()
+            self.audio_snapshot = self.audio_signature()
+            self.last_heartbeat = time.monotonic()
             self.submit('recover_capture', self.reason)
 
     def dispatch(self, message, value):
@@ -79,11 +113,11 @@ class SystemEvents(QObject):
                 self.asleep = False
                 self.queue_resume('Windows resumed from sleep')
         elif message == 0x02B1:  # WM_WTSSESSION_CHANGE
-            if value == 7:  # WTS_SESSION_LOCK
+            if value in (2, 4, 7):  # console/remote disconnect or session lock
                 self.locked = True
                 self.resume_timer.stop()
                 self.submit('suspend_capture', 'Windows session locked')
-            elif value == 8:  # WTS_SESSION_UNLOCK
+            elif value in (1, 3, 8):  # console/remote connect or session unlock
                 self.locked = False
                 self.queue_resume('Windows session unlocked')
         elif message == 0x007E:  # WM_DISPLAYCHANGE
@@ -91,6 +125,7 @@ class SystemEvents(QObject):
 
     def close(self):
         self.closed = True
+        self.heartbeat_timer.stop()
         self.registration_timer.stop()
         self.resume_timer.stop()
         self.audio_timer.stop()

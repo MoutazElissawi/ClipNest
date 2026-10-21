@@ -9,8 +9,14 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
+from fractions import Fraction
 
-ENCODERS = {'NVIDIA H.264': 'h264_nvenc', 'NVIDIA AV1': 'av1_nvenc', 'CPU H.264': 'libx264'}
+ENCODERS = {'NVIDIA H.264': 'h264_nvenc', 'NVIDIA AV1': 'av1_nvenc',
+            'AMD H.264': 'h264_amf', 'AMD HEVC': 'hevc_amf', 'AMD AV1': 'av1_amf',
+            'CPU H.264': 'libx264'}
+# Stream copy: video packets pass through untouched; audio is copied unless edited.
+COPY = 'Copy (no re-encode)'
 
 
 def run(args, **kwargs):
@@ -81,6 +87,81 @@ def available_encoders(ffmpeg, cancel=None):
     return available, failures
 
 
+class EncoderProbeCache:
+    """Short-lived editor capability checks; manual recheck always bypasses."""
+    def __init__(self, inspect):
+        self.inspect = inspect
+        self.entry = None
+        self.lock = threading.Lock()
+
+    def get(self, ffmpeg, force=False):
+        path = Path(ffmpeg).resolve()
+        try:
+            stat = path.stat()
+            key = (str(path), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            key = (str(path),)
+        with self.lock:
+            now = time.monotonic()
+            if not force and self.entry and self.entry[0] == key and now < self.entry[1]:
+                labels, errors = self.entry[2]
+                return list(labels), dict(errors)
+            labels, errors = self.inspect(ffmpeg)
+            # A busy/unavailable GPU can recover quickly; don't pin failures.
+            self.entry = (key, time.monotonic()+(30 if errors else 300), (list(labels), dict(errors)))
+            return list(labels), dict(errors)
+
+
+def normalize_ranges(ranges, duration=None):
+    """Sorted, merged (start, end) ranges; empty or reversed ranges are dropped."""
+    cleaned = []
+    for a, b in ranges:
+        a, b = float(a), float(b)
+        if duration is not None:
+            a, b = max(0.0, a), min(float(duration), b)
+        if math.isfinite(a) and math.isfinite(b) and b - a > 1e-6:
+            cleaned.append((a, b))
+    merged = []
+    for a, b in sorted(cleaned):
+        if merged and a <= merged[-1][1] + 1e-6:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def add_range(ranges, a, b, duration=None):
+    return normalize_ranges(list(ranges) + [(a, b)], duration)
+
+
+def remove_range(ranges, a, b):
+    result = []
+    for x, y in normalize_ranges(ranges):
+        if y <= a or x >= b:
+            result.append((x, y))
+            continue
+        if x < a:
+            result.append((x, a))
+        if y > b:
+            result.append((b, y))
+    return normalize_ranges(result)
+
+
+def keep_only_range(a, b, duration):
+    """Mute everything on a track except a..b ("trim" that track)."""
+    return normalize_ranges([(0.0, a), (b, duration)], duration)
+
+
+def mute_filter(ranges, start, end):
+    """volume filter silencing source-time ranges inside an export that begins at start."""
+    parts = []
+    for a, b in normalize_ranges(ranges):
+        a, b = max(a, start) - start, min(b, end) - start
+        if b - a > 1e-6:
+            parts.append(f'between(t,{a:.6f},{b:.6f})')
+    return f"volume=0:enable='{'+'.join(parts)}'" if parts else ''
+
+
 @dataclass
 class Edit:
     start: float
@@ -96,13 +177,22 @@ class Edit:
     remix: bool = False
     resolution: tuple | None = None
     fps: int = 0
+    upscale: bool = False
+    # stream index -> muted (start, end) ranges in source seconds; the track keeps its length
+    mutes: dict = field(default_factory=dict)
 
 
 def export_args(info, edit, ffmpeg, destination):
+    audio_codec = {'.mp3': 'libmp3lame', '.wav': 'pcm_s16le', '.flac': 'flac', '.m4a': 'aac'}.get(Path(destination).suffix.lower())
     if not (math.isfinite(edit.start) and math.isfinite(edit.end) and 0 <= edit.start < edit.end <= info['duration'] + .001):
         raise ValueError('Choose a start before the end, inside the clip.')
-    if edit.encoder not in ENCODERS or not 1000 <= edit.bitrate <= 200000:
+    copy = edit.encoder == COPY and not audio_codec
+    if not audio_codec and not copy and (edit.encoder not in ENCODERS or not 1000 <= edit.bitrate <= 200000):
         raise ValueError('Choose an available encoder and valid bitrate.')
+    if copy and (edit.crop or edit.resolution or edit.fps or edit.upscale
+                 or (edit.brightness, edit.contrast, edit.saturation) != (0.0, 1.0, 1.0)):
+        raise ValueError('Copy keeps the original video untouched, so crop, color, resolution and FPS changes '
+                         'cannot be applied. Reset them or choose an encoder.')
     dest, source = Path(destination), Path(info['path'])
     if dest.resolve() == source.resolve() or (dest.exists() and source.exists() and dest.samefile(source)):
         raise ValueError('Export must use a new filename; the original is protected.')
@@ -119,34 +209,77 @@ def export_args(info, edit, ffmpeg, destination):
         if len(edit.resolution) != 2 or any(type(v) is not int or v < 2 or v > 4096 or v % 2 for v in edit.resolution):
             raise ValueError('Export resolution must use even dimensions from 2 to 4096.')
         w, h = edit.resolution
-        filters += [f'scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2', f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2']
+        # Always preserve the selected canvas/aspect ratio. Without explicit
+        # opt-in, fit inside BOTH the canvas and original cropped dimensions.
+        sw, sh = edit.crop[2:] if edit.crop else (info['video']['width'], info['video']['height'])
+        try:
+            sar = float(Fraction(info['video'].get('sample_aspect_ratio', '1:1').replace(':', '/')))
+            sw *= sar if math.isfinite(sar) and sar > 0 else 1
+        except (ValueError, ZeroDivisionError, AttributeError):
+            pass
+        scale = min(w/sw, h/sh)
+        if not edit.upscale:
+            scale = min(1.0, scale)
+        fw, fh = max(2, int(sw*scale)//2*2), max(2, int(sh*scale)//2*2)
+        filters += [f'scale={fw}:{fh}:flags=lanczos', 'setsar=1', f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2']
     if edit.fps not in (0, 24, 30, 60):
         raise ValueError('Choose source FPS, 24, 30 or 60.')
     if edit.fps:
         filters.append(f'fps={edit.fps}')
     filters += [f'eq=brightness={edit.brightness}:contrast={edit.contrast}:saturation={edit.saturation}', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', 'format=yuv420p']
     args = [ffmpeg, '-hide_banner', '-v', 'error', '-nostdin', '-n', '-ss', f'{edit.start:.6f}', '-i', info['path'],
-            '-t', f'{edit.end-edit.start:.6f}', '-map', f"0:{info['video']['index']}", '-vf', ','.join(filters),
-            '-c:v', ENCODERS[edit.encoder], '-b:v', f'{edit.bitrate}k']
+            '-t', f'{edit.end-edit.start:.6f}', '-map', f"0:{info['video']['index']}"]
+    if copy:
+        # Copied video must start on a keyframe, so it begins at the keyframe before Start.
+        # Shifting every stream by the same offset keeps re-encoded audio in sync.
+        args += ['-c:v', 'copy', '-avoid_negative_ts', 'make_zero']
+    else:
+        args += ['-vf', ','.join(filters), '-c:v', ENCODERS.get(edit.encoder, 'libx264'), '-b:v', f'{edit.bitrate}k']
     indexes = {s['index'] for s in info['audio']}
+    if audio_codec:
+        if not edit.audio:
+            raise ValueError('Select an audio track to export.')
+        if len(edit.audio) > 1 and not edit.remix:
+            raise ValueError('Audio exports need one track. Select one track or enable combining audio tracks.')
+        args = [ffmpeg, '-hide_banner', '-v', 'error', '-nostdin', '-n', '-ss', f'{edit.start:.6f}', '-i', info['path'],
+                '-t', f'{edit.end-edit.start:.6f}', '-vn']
+    if not audio_codec and not copy and ENCODERS[edit.encoder].endswith('_amf'):
+        args += ['-rc', 'cbr']
     seen = set()
     if edit.remix and len(edit.audio) > 1 and any(title.strip().casefold() == 'mix' for _, title, _ in edit.audio):
         raise ValueError('Uncheck the existing Mix track before combining isolated tracks; otherwise audio is doubled.')
     mix_filters = []
+    for ranges in (edit.mutes or {}).values():
+        if any(not (math.isfinite(a) and math.isfinite(b) and 0 <= a < b <= info['duration'] + .001) for a, b in ranges):
+            raise ValueError('Muted audio ranges must lie inside the clip.')
     for i, (index, title, gain) in enumerate(edit.audio):
         if index not in indexes or index in seen or not math.isfinite(gain) or not 0 <= gain <= 2:
             raise ValueError('Invalid audio track or volume.')
         seen.add(index)
+        mutes = mute_filter((edit.mutes or {}).get(index, ()), edit.start, edit.end)
+        chain = ','.join(f for f in (f'volume={gain}', mutes) if f)
         if edit.remix:
-            mix_filters.append(f'[0:{index}]volume={gain}[audio{i}]')
+            mix_filters.append(f'[0:{index}]{chain}[audio{i}]')
         else:
-            args += ['-map', f'0:{index}', f'-filter:a:{i}', f'volume={gain}', f'-metadata:s:a:{i}', f'title={title}',
-                     f'-disposition:a:{i}', 'default' if i == 0 else '0']
+            args += ['-map', f'0:{index}']
+            if copy and gain == 1 and not mutes:
+                args += [f'-c:a:{i}', 'copy']
+            else:
+                args += [f'-filter:a:{i}', chain]
+                if copy:
+                    args += [f'-c:a:{i}', 'aac', f'-b:a:{i}', '192k']
+            args += [f'-metadata:s:a:{i}', f'title={title}', f'-disposition:a:{i}', 'default' if i == 0 else '0']
     if edit.remix and edit.audio:
         inputs = ''.join(f'[audio{i}]' for i in range(len(edit.audio)))
         mix_filters.append(f'{inputs}amix=inputs={len(edit.audio)}:normalize=0:dropout_transition=0,alimiter=limit=0.98:level=false:latency=true[remix]')
         args += ['-filter_complex', ';'.join(mix_filters), '-map', '[remix]', '-metadata:s:a:0', 'title=Remix', '-disposition:a:0', 'default']
-    args += ['-c:a', 'aac', '-b:a', '192k', '-map_metadata', '-1', '-map_chapters', '-1', '-progress', 'pipe:1', '-nostats']
+    if not copy:
+        args += ['-c:a', audio_codec or 'aac']
+        if audio_codec not in ('pcm_s16le', 'flac'):
+            args += ['-b:a', '192k']
+    elif edit.remix and edit.audio:
+        args += ['-c:a:0', 'aac', '-b:a:0', '192k']
+    args += ['-map_metadata', '-1', '-map_chapters', '-1', '-progress', 'pipe:1', '-nostats']
     if Path(destination).suffix.lower() == '.mp4':
         args += ['-movflags', '+faststart']
     return args + [str(destination)]
@@ -159,8 +292,8 @@ def file_identity(path):
 
 def export_clip(info, edit, ffmpeg, target, cancel=None, progress=None, *, overwrite=False, expected_target=None):
     target = Path(target).resolve()
-    if target.suffix.lower() not in ('.mkv', '.mp4'):
-        raise ValueError('Choose an MKV or MP4 filename.')
+    if target.suffix.lower() not in ('.mkv', '.mp4', '.mp3', '.wav', '.flac', '.m4a'):
+        raise ValueError('Choose an MKV, MP4, MP3, WAV, FLAC or M4A filename.')
     if target.exists() and not overwrite:
         raise ValueError('That file already exists. Confirm replacement or choose a new filename.')
     approved = expected_target
@@ -228,7 +361,13 @@ def export_clip(info, edit, ffmpeg, target, cancel=None, progress=None, *, overw
     return str(target)
 
 
-def estimated_size(edit):
+def estimated_size(edit, info=None):
+    if edit.encoder == COPY and info:
+        # Copy keeps the source bitrate; the keyframe pre-roll adds a little.
+        try:
+            return os.path.getsize(info['path']) * max(0, edit.end-edit.start) / info['duration']
+        except (OSError, KeyError, ZeroDivisionError):
+            return 0
     tracks = 1 if edit.remix and edit.audio else len(edit.audio)
     return max(0, edit.end-edit.start) * (edit.bitrate + 192*tracks) * 1000/8
 

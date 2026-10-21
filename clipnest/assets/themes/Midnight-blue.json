@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "Midnight blue",
+  "colors": {
+    "background": "#10151f",
+    "surface": "#18202e",
+    "raised": "#243044",
+    "border": "#40506b",
+    "text": "#eef3ff",
+    "muted": "#acb8d0",
+    "accent": "#82b4ff",
+    "accent_hover": "#a9cdff",
+    "accent_text": "#101923",
+    "selection": "#243c5d",
+    "danger": "#a92b35",
+    "danger_hover": "#c23642"
+  }
+}

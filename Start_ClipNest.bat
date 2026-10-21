@@ -8,7 +8,12 @@ if exist "runtime\pythonw.exe" (
 if exist ".venv\Scripts\python.exe" goto ready
 where py >nul 2>nul
 if errorlevel 1 goto trypython
+rem PySide6 6.8 supports Python 3.11-3.13; plain "py -3" may pick a newer interpreter.
+for %%V in (3.13 3.12 3.11) do (
+    py -%%V -c "" >nul 2>nul && (py -%%V -m venv .venv & goto venvmade)
+)
 py -3 -m venv .venv
+:venvmade
 if errorlevel 1 goto failed
 goto install
 :trypython

@@ -1,9 +1,9 @@
-; Build through Build_Installer.bat so PayloadDir contains the private runtime.
+; Build through packaging\Build_Installer.bat so PayloadDir contains the private runtime.
 #ifndef PayloadDir
   #error Supply /DPayloadDir with the staged runtime directory
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.8.0"
+  #define AppVersion "2.0.0-beta.12"
 #endif
 [Setup]
 AppId={{B802DB77-26F6-4806-BBF3-2AC0BE0B48E4}

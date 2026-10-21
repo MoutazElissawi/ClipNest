@@ -43,6 +43,7 @@ class JoinDialog(QDialog):
         self.audio_order = QCheckBox('If titles differ, match audio tracks by position and use titles from the first clip')
         layout.addWidget(self.audio_order)
         self.progress = QProgressBar()
+        self.progress.setStyleSheet('QProgressBar {min-height: 26px; max-height: 26px; text-align: center;}')
         layout.addWidget(self.progress)
         self.eta = ExportETA()
         self.status = QLabel()
@@ -122,7 +123,20 @@ class JoinDialog(QDialog):
         # Snapshot controls on the GUI thread, before worker execution.
         paths, encoder, bitrate, order = list(self.paths), self.encoder.currentText(), self.bitrate.value(), self.audio_order.isChecked()
         self.launch(lambda job: combine(paths, self.ffmpeg, self.ffprobe, target, reencode, encoder, bitrate, job.cancel, job.progress.emit, order),
-                    lambda path: self.status.setText('Saved: ' + path))
+                    self.saved)
+
+    def saved(self, path):
+        self.status.setText('Saved: ' + path)
+        from .exports import register_export
+        try:
+            register_export(path)
+        except OSError:
+            self.status.setText('Saved, but gallery entry could not be stored: ' + path)
+        owner = self.parent()
+        while owner is not None and not hasattr(owner, 'capture_notice'):
+            owner = owner.parent()
+        if owner is not None:
+            owner.capture_notice(dict(title='Export complete', detail=Path(path).name, sound=True))
 
     def progress_changed(self, percent):
         self.progress.setValue(percent)

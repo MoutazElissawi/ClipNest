@@ -6,6 +6,7 @@ closed segments; capture keeps writing the next one. Failed saves retain sources
 from __future__ import annotations
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -56,16 +57,33 @@ class Segment:
 
 
 def segment_timing(path, ffprobe, cancel=None):
-    r = replay_run([ffprobe, '-v', 'error', '-select_streams', 'v:0', '-show_packets',
-             '-show_entries', 'packet=pts_time,duration_time:stream=avg_frame_rate', '-show_streams', '-of', 'json', str(path)], timeout=20, cancel=cancel)
+    r = replay_run([ffprobe, '-v', 'error', '-show_packets',
+             '-show_entries', 'packet=stream_index,pts_time,dts_time,duration_time,flags:stream=index,codec_type,avg_frame_rate', '-show_streams', '-of', 'json', str(path)], timeout=20, cancel=cancel)
     if r.returncode:
         raise ValueError(r.stderr[-1000:] or 'Segment is not ready')
     data = json.loads(r.stdout)
-    packets = data.get('packets', [])
+    streams, all_packets = data.get('streams', []), data.get('packets', [])
+    video = next((s for s in streams if s.get('codec_type') == 'video'), None)
+    audio = [s for s in streams if s.get('codec_type') == 'audio']
+    # Mix, Desktop and Microphone, plus an optional application track.
+    if video is None or len(audio) not in (3, 4):
+        raise ValueError('Replay segment is missing video or one of its audio tracks. Cache retained.')
+    indexes = {packet.get('stream_index') for packet in all_packets}
+    if any(s['index'] not in indexes for s in [video, *audio]):
+        raise ValueError('Replay segment contains an empty media track. Cache retained.')
+    packets = [p for p in all_packets if p.get('stream_index') == video['index']]
+    if packets and 'K' not in packets[0].get('flags', ''):
+        raise ValueError('Replay segment does not begin with a keyframe. Cache retained.')
+    for stream in [video, *audio]:
+        times = [float(p['dts_time']) for p in all_packets if p.get('stream_index') == stream['index'] and 'dts_time' in p]
+        if any(not math.isfinite(t) for t in times) or any(b < a for a,b in zip(times, times[1:])):
+            raise ValueError('Replay segment has invalid media timestamps. Cache retained.')
     stamps = [float(p['pts_time']) for p in packets if 'pts_time' in p]
     if not stamps:
         raise ValueError('Segment has no video packets')
-    rate = float(Fraction(data['streams'][0].get('avg_frame_rate', '30/1')))
+    rate = float(Fraction(video.get('avg_frame_rate', '30/1')))
+    if not math.isfinite(rate) or rate <= 0 or any(not math.isfinite(t) for t in stamps):
+        raise ValueError('Replay segment has invalid video timing. Cache retained.')
     return max(stamps)-min(stamps)+1/rate, min(stamps)
 
 
@@ -170,6 +188,7 @@ class ContinuousReplay(threading.Thread):
                     return
                 continue
             _, raw, next_path, context = command
+            validated = False
             try:
                 if self.cancel.is_set():
                     raise ReplayCancelled('Closing ClipNest; unfinished replay sources were retained')
@@ -185,6 +204,7 @@ class ContinuousReplay(threading.Thread):
                         if self.cancel.wait(.05):
                             raise ReplayCancelled('Closing ClipNest; unfinished replay sources were retained')
                 duration, start = segment_timing(path, self.ffprobe, cancel=self.cancel)
+                validated = True
                 self.segments.append(Segment(path, duration, start))
                 total = sum(s.duration for s in self.segments)
                 while len(self.segments) > 1 and total-self.segments[0].duration >= self.seconds:
@@ -201,5 +221,7 @@ class ContinuousReplay(threading.Thread):
                     self.segments = []
                     self.expired = self.failed = False
             except Exception as exc:
+                if not validated:
+                    self.segments = []  # keep cache files, exclude the broken interval from future saves
                 self.failed = True
                 self.results.put(('aborted' if isinstance(exc, ReplayCancelled) else 'error', str(exc), context, False))
