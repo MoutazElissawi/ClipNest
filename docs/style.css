@@ -1,0 +1,79 @@
+/* Hallmark · shape: Overlay Stage · genre: atmospheric · theme: custom · job: try · idea: "the recorder floats over your game, so the page does too" · vibe: "black glass, green signal, game running underneath"
+ * paper: oklch(13% 0.012 135) · accent: oklch(72% 0.2 128) · display: Barlow Condensed · body: Barlow · hero: full-bleed real gameplay, one frosted panel left, the real ClipNest window overlapping right · nav: wordmark and one text link over the frame · footer: one line, licence left, disclaimer right · imagery: the product (real frames and real app captures) · signature: the real glass ClipNest window sitting over live Valorant gameplay
+ * axes: near-black/condensed-grotesk/signal-green · posture: immersive · contrast: pass · fold: pass · v2.0.0 */
+/* Hallmark · pre-emit critique: P4 H4 E4 S4 R3 V4 · weakest: R, glass is limited to the panel over the frame so it reads as the app's own material, not decoration */
+@import url("./tokens.css");
+@import url("./base.css");
+
+html { scrollbar-color: var(--color-paper-3) var(--color-paper); }
+body { font-size: 1.0625rem; }
+::selection { background: color-mix(in oklab, var(--color-accent) 35%, transparent); color: var(--color-ink); }
+
+.hero { position: relative; min-height: clamp(640px, 92dvh, 940px); display: grid; align-items: end; padding-bottom: var(--space-3xl); isolation: isolate; }
+.hero > img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -2; }
+.hero::after { content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, color-mix(in oklab, var(--color-paper) 55%, transparent) 0%, transparent 30%, color-mix(in oklab, var(--color-paper) 85%, transparent) 100%); }
+.nav { position: absolute; top: 0; left: 0; right: 0; }
+.nav .container { display: flex; justify-content: space-between; align-items: center; padding-block: var(--space-lg); }
+.wordmark { display: inline-flex; align-items: center; gap: var(--space-xs); font: 700 var(--text-xl) / 1 var(--font-display); text-decoration: none; }
+.wordmark img { width: 32px; height: 32px; border-radius: 8px; }
+.nav a:not(.wordmark) { font-weight: 600; text-decoration-color: var(--color-accent); }
+.nav a:hover, a:active { color: var(--color-accent); }
+
+.hero .container { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: var(--space-xl); align-items: end; }
+.panel { padding: var(--space-xl); border-radius: 18px; background: var(--color-glass); border: var(--rule-hair) solid var(--color-glass-edge); backdrop-filter: blur(20px) saturate(150%); -webkit-backdrop-filter: blur(20px) saturate(150%); }
+.panel h1 { font-size: var(--text-display); font-weight: 700; line-height: 0.92; letter-spacing: -0.01em; }
+.panel p { margin-top: var(--space-md); font-size: var(--text-lead); color: var(--color-ink-2); }
+.actions { margin-top: var(--space-xl); }
+.button { display: inline-flex; align-items: center; min-height: 54px; padding: 0 var(--space-xl); border-radius: 10px; background: var(--color-accent); color: var(--color-accent-ink); font-weight: 700; font-size: var(--text-lg); text-decoration: none; transition: background-color var(--dur-short) var(--ease-out), transform var(--dur-micro) var(--ease-out); }
+.button:hover { background: color-mix(in oklab, var(--color-accent) 85%, var(--color-ink)); }
+.button:active { transform: translateY(1px); }
+.button:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 3px; }
+.small { margin-top: var(--space-md); font-size: var(--text-sm); color: var(--color-muted); }
+.window { border-radius: 12px; box-shadow: 0 40px 80px -30px color-mix(in oklab, var(--color-paper) 95%, transparent); transform: translateY(var(--space-xl)); }
+
+.band { padding-block: var(--section-gap); }
+.split { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: var(--space-2xl); align-items: center; }
+.split.flip { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+h2 { font-size: var(--text-section); font-weight: 700; line-height: 0.98; }
+.split p { margin-top: var(--space-md); color: var(--color-ink-2); }
+.shot { border-radius: 12px; border: var(--rule-hair) solid var(--color-rule); }
+.games { display: flex; flex-wrap: wrap; gap: var(--space-xs); margin: var(--space-lg) 0 0; padding: 0; list-style: none; }
+.games li { padding: var(--space-xs) var(--space-md); border-radius: 6px; background: var(--color-paper-2); border: var(--rule-hair) solid var(--color-rule); font-weight: 600; }
+.games li:first-child { border-color: var(--color-accent); color: var(--color-accent); }
+
+.specs { padding-block: var(--section-gap-s); border-top: var(--rule-hair) solid var(--color-rule); border-bottom: var(--rule-hair) solid var(--color-rule); background: var(--color-paper-2); }
+.specs .container { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: var(--space-2xl); }
+dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); margin: 0; }
+dt, dd { margin: 0; padding-block: var(--space-md); border-bottom: var(--rule-hair) solid var(--color-rule); }
+dt { color: var(--color-muted); }
+
+.install ol { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap-columns); margin: var(--space-xl) 0 0; padding: 0; list-style: none; counter-reset: step; }
+.install li { counter-increment: step; }
+.install li::before { content: counter(step); display: block; font: 700 var(--text-3xl) / 1 var(--font-display); color: var(--color-accent); margin-bottom: var(--space-sm); }
+.install li b { display: block; font-size: var(--text-lg); margin-bottom: var(--space-2xs); }
+.install li span { color: var(--color-ink-2); }
+code { font-size: 0.92em; padding: var(--space-3xs) var(--space-xs); border-radius: 4px; background: var(--color-paper-3); }
+
+.foot .container { display: flex; justify-content: space-between; gap: var(--space-lg); flex-wrap: wrap; padding-block: var(--space-xl); border-top: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); color: var(--color-muted); }
+
+@media (max-width: 60rem) {
+  .hero .container, .split, .split.flip, .specs .container { grid-template-columns: minmax(0, 1fr); }
+  .window { transform: none; }
+  .install ol { grid-template-columns: minmax(0, 1fr); }
+  .split.flip .shot { order: 2; }
+}
+
+.sub { margin-top: var(--space-lg); font: 700 var(--text-lg) / 1.2 var(--font-body); color: var(--color-accent); }
+.sub + p { margin-top: var(--space-xs); }
+.points { margin: var(--space-lg) 0 0; padding-left: var(--space-lg); color: var(--color-accent); font-weight: 600; font-size: var(--text-lg); }
+.points li { padding-block: var(--space-2xs); }
+.points li::marker { color: var(--color-accent); }
+
+.scroll-cue { position: fixed; left: 50%; bottom: var(--space-md); z-index: var(--z-sticky); display: grid; place-items: center; width: 44px; height: 44px; border-radius: var(--radius-pill); color: var(--color-accent); translate: -50% 0; transition: opacity var(--dur-short) var(--ease-out); animation: nudge 1.8s var(--ease-in-out) infinite; }
+.scroll-cue:hover { color: var(--color-ink); }
+.scroll-cue:active { color: var(--color-focus); }
+.scroll-cue:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.scroll-cue.is-hidden { opacity: 0; pointer-events: none; }
+@keyframes nudge { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(6px); } }
+.band.tight { padding-top: 0; }
+.scroll-cue:hover, .scroll-cue:focus-visible { animation-play-state: paused; }

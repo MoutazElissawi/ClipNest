@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ClipNest: free instant replay and clip editor for Windows</title>
+<meta name="description" content="ClipNest is a free, open-source Windows screen recorder with instant replay, clips sorted by game automatically, and a built-in editor. A ShadowPlay alternative.">
+<link rel="canonical" href="https://moutazelissawi.github.io/ClipNest/">
+<link rel="icon" type="image/png" href="favicon.png">
+<meta property="og:type" content="website">
+<meta property="og:title" content="ClipNest: record your best moments">
+<meta property="og:description" content="Free, open-source instant replay and clip editor for Windows.">
+<meta property="og:url" content="https://moutazelissawi.github.io/ClipNest/">
+<meta property="og:image" content="https://moutazelissawi.github.io/ClipNest/social-preview.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700&family=Barlow:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="hero">
+  <img src="hero-frame.jpg" width="1600" height="860" alt="">
+  <nav class="nav" aria-label="Main">
+    <div class="container">
+      <a class="wordmark" href="./"><img src="logo.png" alt="">ClipNest</a>
+      <a href="https://github.com/MoutazElissawi/ClipNest">Source on GitHub</a>
+    </div>
+  </nav>
+  <div class="container">
+    <div class="panel">
+      <h1>Record your best moments.</h1>
+      <p>Save up to 30 minutes of recent gameplay with any hotkey.</p>
+      <div class="actions"><a class="button" href="https://github.com/MoutazElissawi/ClipNest/releases/latest">Download for Windows</a></div>
+      <p class="small">Free and open source, for Windows 10 and 11.</p>
+    </div>
+    <img class="window" src="app-main.png" width="1500" height="940" alt="ClipNest running over the game with instant replay ready">
+  </div>
+</header>
+
+<main>
+  <section class="band" aria-labelledby="sorted">
+    <div class="container split">
+      <img class="shot" src="valorant-58.jpg" width="1600" height="900" loading="lazy" alt="A saved Valorant clip">
+      <div>
+        <h2 id="sorted">Sorted by the game you played.</h2>
+        <h3 class="sub">Auto-detect games</h3>
+        <p>ClipNest reads which game is running and saves the clip in a folder with its name, even for games that hide from screen capture, like Valorant.</p>
+        <ul class="games"><li>Valorant</li><li>Helldivers 2</li><li>Rocket League</li><li>Chivalry 2</li><li>Desktop</li></ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="band tight" aria-labelledby="edit">
+    <div class="container split flip">
+      <div>
+        <h2 id="edit">Built-in editor for your convenience</h2>
+        <ul class="points">
+          <li>Separate audio tracks</li>
+          <li>Edit audio separately from video</li>
+          <li>Combine two clips into one with zero delay between them</li>
+        </ul>
+        <p>Trim to the frame, crop, or mute your mic for a moment and keep the game audio. Copy mode exports in seconds with no re-encode.</p>
+      </div>
+      <img class="shot" src="editor-rocket-league.webp" width="1950" height="1250" loading="lazy" alt="The ClipNest editor with a Rocket League clip, a selected stretch of audio and three audio tracks">
+    </div>
+  </section>
+
+  <section class="specs" aria-labelledby="needs">
+    <div class="container">
+      <h2 id="needs">What you need</h2>
+      <dl>
+        <dt>System</dt><dd>Windows 10/11, 64-bit</dd>
+        <dt>Price</dt><dd>Free</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section class="band install" aria-labelledby="start">
+    <div class="container">
+      <h2 id="start">Three steps and you’re recording</h2>
+      <ol>
+        <li><b>Install it</b><span>Run the setup file from the latest release. No admin rights.</span></li>
+        <li><b>Add FFmpeg</b><span>In the editor, go to File → FFmpeg folder → the folder with <code>ffmpeg.exe</code>.</span></li>
+        <li><b>Play</b><span>Start replay, then press your hotkey when something happens.</span></li>
+      </ol>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="container">
+    <span>ClipNest, GPL-2.0-or-later, built on the OBS recording engine.</span>
+    <span>Not affiliated with OBS, NVIDIA, AMD or Riot Games.</span>
+  </div>
+</footer>
+<a class="scroll-cue" href="#sorted" aria-label="Scroll to see more">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+</a>
+<script>
+  // Hide the scroll hint as soon as the visitor starts scrolling.
+  const cue = document.querySelector('.scroll-cue');
+  const update = () => cue.classList.toggle('is-hidden', window.scrollY > 40);
+  window.addEventListener('scroll', update, { passive: true });
+  update();
+</script>
+</body>
+</html>
