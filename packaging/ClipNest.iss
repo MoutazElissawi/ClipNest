@@ -3,7 +3,7 @@
   #error Supply /DPayloadDir with the staged runtime directory
 #endif
 #ifndef AppVersion
-  #define AppVersion "2.1.0"
+  #define AppVersion "2.1.1"
 #endif
 [Setup]
 AppId={{B802DB77-26F6-4806-BBF3-2AC0BE0B48E4}

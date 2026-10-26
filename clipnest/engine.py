@@ -35,6 +35,10 @@ GAME_LAYER_SETTINGS = {"capture_mode": "any_fullscreen", "capture_cursor": True,
 # Games only: one hook that follows the focused game and never shows another window.
 GAME_CAPTURE_SETTINGS = {"capture_mode": "window", "window": "", "priority": 2, "capture_cursor": True,
                          "anti_cheat_hook": True, "capture_audio": False, "allow_transparency": False}
+# Settings the GUI uses on its own; changing only these never restarts capture.
+LIVE_SETTINGS = {"replay_key", "record_key", "ptt_key", "mic_mode", "mic_volume", "notifications_enabled",
+                 "notification_corner", "notification_seconds", "notification_screen", "ui_theme", "glass_tint",
+                 "theme_file", "storage_limit_gb", "export_sound", "games"}
 # SystemEvents' reason for WM_DISPLAYCHANGE, which fullscreen games cause on Alt-Tab.
 DISPLAY_CHANGED = "Display configuration changed"
 JOURNAL = DATA / "pending.json"
@@ -827,6 +831,13 @@ class Engine(QThread):
             self.handle('toggle_record', None)
         self.notify('Capture recovered', 'A fresh session started. Footage across sleep/lock/display changes is not continuous.' if any(intent.values()) else 'Recorder devices reconnected.')
 
+    def needs_reconnect(self, data):
+        """Only settings the native recorder uses need a fresh recorder (and stopped outputs)."""
+        changed = {key for key in set(data) | set(self.settings) if data.get(key) != self.settings.get(key)}
+        if data.get("capture_target") not in ("window", "game"):
+            changed.discard("window_value")  # an unrefreshed window list sends "" here
+        return bool(changed - LIVE_SETTINGS)
+
     def apply_audio_devices(self, data=None, only=('desktop_device', 'mic_device')):
         proposed = {key: (data or self.settings).get(key, self.settings[key])
                     for key in ('desktop_device', 'mic_device')}
@@ -977,6 +988,14 @@ class Engine(QThread):
             self.message.emit("Appearance saved as " + ("Frosted glass." if theme == "glass" else "Classic dark."))
         elif command == "apply":
             validate(data)
+            if self.rpc and not self.needs_reconnect(data):
+                # Shortcuts, notifications and appearance apply live; capture keeps running.
+                atomic_json(SETTINGS, data)
+                self.settings = copy.deepcopy(data)
+                self.catalog.custom = self.settings["games"]
+                self.applied.emit(copy.deepcopy(self.settings))
+                self.message.emit("Settings saved.")
+                return
             if self.rpc:
                 if self.call("GetRecordStatus")["outputActive"] or self.call("GetReplayBufferStatus")["outputActive"]:
                     raise ValueError("Stop recording and replay before applying capture settings.")

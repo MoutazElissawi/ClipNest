@@ -943,12 +943,12 @@ class Window(DesktopWindow):
             self.show_error(str(exc))
 
     def shortcut_capture(self, active):
+        # Releasing the keys lets the field receive them. The native filter and system
+        # events stay: the filter is the only path WM_HOTKEY takes, and submit() already
+        # ignores shortcuts while capturing. Removing it left new shortcuts dead until restart.
         self.capturing_shortcut = active
         if active:
             self.hotkeys.close()
-            if self.system_events is not None:
-                self.system_events.close()
-            QApplication.instance().removeNativeEventFilter(self.native_filter)
         elif not self.preview:
             self.register_hotkeys()
 

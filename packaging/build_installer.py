@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = '2.1.0'
+VERSION = '2.1.1'
 # Only what the app needs to run, plus its license notices and README.
 PUBLIC_FILES = ('main.py', 'bootstrap.py', 'Launch_ClipNest.pyw', 'Start_ClipNest.bat', 'Launch_Classic_Mode.bat',
                 'requirements.txt', 'LICENSE.txt', 'THIRD_PARTY.md', 'README.md')
