@@ -1,7 +1,6 @@
 """Install official OBS runtime libraries into ClipNest's private data folder."""
 import hashlib
 import os
-from pathlib import Path
 import shutil
 import sys
 import urllib.request
@@ -19,9 +18,12 @@ REQUIRED = ["bin/64bit/obs.dll", "bin/64bit/libobs-d3d11.dll", "bin/64bit/obs-ff
                 "obs-plugins/64bit/obs-ffmpeg.dll", "obs-plugins/64bit/obs-nvenc.dll", "obs-plugins/64bit/obs-x264.dll"]
 
 
+def version_file():
+    return ENGINE / "clipnest-engine-version.txt"
+
+
 def is_ready():
-    marker = ENGINE / "clipnest-engine-version.txt"
-    return (marker.is_file() and marker.read_text().strip() == OBS_VERSION
+    return (version_file().is_file() and version_file().read_text().strip() == OBS_VERSION
             and all((ENGINE / name).is_file() for name in REQUIRED))
 
 
@@ -31,7 +33,6 @@ def setup():
         raise RuntimeError("Install 64-bit Python. The recorder libraries are Windows x64.")
     if os.name != "nt":
         raise RuntimeError("ClipNest capture requires Windows 10/11 x64.")
-    marker = ENGINE / "clipnest-engine-version.txt"
     if is_ready():
         return
     DATA.mkdir(parents=True, exist_ok=True)
@@ -72,7 +73,7 @@ def setup():
     else:
         temp.rename(ENGINE)
     (ENGINE / "portable_mode.txt").touch()
-    (ENGINE / "clipnest-engine-version.txt").write_text(OBS_VERSION)
+    version_file().write_text(OBS_VERSION)
     archive.unlink(missing_ok=True)
     print("Native recorder libraries ready. ClipNest does not launch OBS Studio.", flush=True)
 

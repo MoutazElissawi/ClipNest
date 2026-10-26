@@ -72,8 +72,23 @@ def user32():
         u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         u.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         u.EnumDisplayDevicesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DISPLAY_DEVICEW), wintypes.DWORD]
+        for name in ("IsWindow", "IsWindowVisible", "IsIconic"):
+            getattr(u, name).argtypes = [wintypes.HWND]
         _user32 = u
     return _user32
+
+
+def window_shown(hwnd):
+    """False once the window is closed, hidden or minimized."""
+    if os.name != "nt" or not hwnd:
+        return False
+    u = user32()
+    return bool(u.IsWindow(hwnd) and u.IsWindowVisible(hwnd) and not u.IsIconic(hwnd))
+
+
+def window_spec(title, window_class, exe):
+    """OBS 'title:class:exe' window setting, escaping # and : the way OBS does."""
+    return ":".join(str(part or "").replace("#", "#22").replace(":", "#3A") for part in (title, window_class, exe))
 
 
 def monitor_device(monitor_id):

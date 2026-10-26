@@ -22,8 +22,9 @@ Windows screen recorder with instant replay, automatic game folders, a clip gall
 
 ## Features
 - Instant replay with a hotkey, plus manual recording at the same time.
-- Record one display, all displays stitched into one video, a single window, or a game. Games that hide from screen capture, such as VALORANT, are recorded through a game hook.
-- Separate Mix, Desktop and Microphone audio tracks, plus an optional track for one app (e.g. Spotify). Push-to-talk and mic controls.
+- Games only (the default): records just the game you are playing, never the desktop or other apps. Alt-Tab keeps the game in the clip, a minimized game records black, and the replay never restarts. Games that hide from screen capture, such as VALORANT, are recorded too.
+- Or record one display, all displays stitched into one video, or a single window.
+- Separate Mix, Desktop and Microphone audio tracks, plus an optional track for one app (e.g. Spotify). Optionally record only the game's audio. Push-to-talk and mic controls.
 - Clips are sorted into folders by game automatically.
 - Gallery with search, favorites, tags, a game filter and quick playback.
 - Editor: trim, crop, colors, per-track volume and muting, export to MKV, MP4, MP3, M4A, WAV or FLAC, or Copy (no re-encode) for instant lossless trims.

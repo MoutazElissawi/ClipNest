@@ -116,6 +116,9 @@ class NativeEngine:
         """New capture clients for a new session; never disturb shared live output."""
         if self.capture_attached or self.active('record') or self.active('replay'):
             return
+        if self.settings.get("capture_target") == "games":
+            # A game hook is not a display client, and a fresh source would lose its shown/black state.
+            return
         names = [n for n in self.input_settings if n == 'CN Screen' or n.startswith('CN Screen ')]
         for name in names:
             self.refresh_screen(name)
@@ -144,8 +147,10 @@ class NativeEngine:
     def prepare_capture(self):
         if self.settings.get("capture_target") in ("window", "game") and not self.settings.get("window_value"):
             raise RuntimeError("Select a capture window in Settings before starting replay or recording.")
+        # Games only records black until a game has focus, so no game is not an error.
+        games = self.settings.get("capture_target") == "games"
         if self.capture_attached:
-            if not self.capture_ready():
+            if not games and not self.capture_ready():
                 raise RuntimeError("The active capture source is unavailable. Reconnect capture before starting another output.")
             return
         if not self.scene:
@@ -153,6 +158,8 @@ class NativeEngine:
         self.refresh_idle_screen()
         self.lib.obs_set_output_source(0, self.lib.obs_scene_get_source(self.scene))
         self.capture_attached = True
+        if games:
+            return
         # Let the graphics thread activate the source before checking its size.
         time.sleep(.1)
         if (self.capture_ready(timeout=10) if self.settings.get("capture_target") == "game" else self.capture_ready()):
@@ -193,7 +200,8 @@ class NativeEngine:
         l.obs_encoder_set_video(video, l.obs_get_video())
         audio = []
         from .config import app_track_name
-        names = ["Mix", "Desktop", "Microphone"] + ([app_track_name(s["app_audio"]) or "Application"] if s.get("app_audio") else [])
+        game_audio = s.get("capture_target") == "games" and s.get("game_audio_only")
+        names = ["Mix", "Game" if game_audio else "Desktop", "Microphone"] + ([app_track_name(s["app_audio"]) or "Application"] if s.get("app_audio") else [])
         for index, name in enumerate(names):
             with l.data({"bitrate": s.get('mic_bitrate' if name == 'Microphone' else 'audio_bitrate', 192)}) as data:
                 enc = l.obs_audio_encoder_create(b"ffmpeg_aac", utf8(name), data, index, None)
@@ -501,7 +509,6 @@ class NativeEngine:
                 C.windll.ole32.CoUninitialize()
                 self.com_initialized = False
             return
-        l = self.lib
         errors = []
         for kind in ("record", "replay"):
             try:

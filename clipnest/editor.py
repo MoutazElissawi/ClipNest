@@ -7,12 +7,12 @@ from fractions import Fraction
 
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize
 from PySide6.QtGui import QImage, QIcon
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QFileDialog, QMessageBox, QSlider, QDoubleSpinBox, QComboBox, QTableWidget,
-    QTableWidgetItem, QCheckBox, QProgressBar, QDialog, QFormLayout, QSpinBox,
-    QDialogButtonBox, QScrollArea, QSplitter, QInputDialog, QLayout, QSizePolicy, QGridLayout)
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QFileDialog, QMessageBox, QDoubleSpinBox, QComboBox, QTableWidget, QTableWidgetItem, QCheckBox,
+    QDialog, QFormLayout, QSpinBox, QDialogButtonBox, QSplitter, QInputDialog,
+    QLayout, QSizePolicy, QGridLayout)
 
 from .config import DATA, atomic_json
 from .media import (tools_path, probe, available_encoders, Edit, export_clip, ENCODERS, COPY, estimated_size, ExportETA, EncoderProbeCache,
@@ -20,6 +20,9 @@ from .media import (tools_path, probe, available_encoders, Edit, export_clip, EN
 from .preview import VideoCanvas, Waveform
 from .editor_assets import waveform
 from .export_progress import ExportProgressBar
+
+
+AUDIO_FORMATS = ('mp3', 'm4a', 'wav', 'flac')
 
 
 class Job(QThread):
@@ -267,9 +270,9 @@ class Editor(DesktopWindow):
         note.setWordWrap(True)
         note.setStyleSheet("font-size: 11px; color: #bfbfbf;")
         side.addWidget(note)
-        preview_export = QPushButton('Preview export…')
-        preview_export.clicked.connect(self.preview_export)
-        side.addWidget(preview_export)
+        self.preview_export_button = QPushButton('Preview export…')
+        self.preview_export_button.clicked.connect(self.preview_export)
+        side.addWidget(self.preview_export_button)
         side.addSpacing(4)
         side.addWidget(QLabel("EXPORT"))
         form = QFormLayout()
@@ -413,7 +416,7 @@ class Editor(DesktopWindow):
         return choice
 
     def update_size_estimate(self, *_):
-        if hasattr(self, 'size_estimate') and self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac'):
+        if hasattr(self, 'size_estimate') and self.audio_export():
             self.size_estimate.setText('Audio only · select one track or combine isolated tracks. MP3/M4A: 192 kb/s.')
             return
         if hasattr(self, 'size_estimate') and self.info and hasattr(self, 'track_rows'):
@@ -511,8 +514,13 @@ class Editor(DesktopWindow):
 
     def current_edit(self):
         audio = [(index, title, volume.value()/100) for index, title, check, volume, _ in self.track_rows if check.isChecked()]
+        # Copy greys out resolution/FPS/upscale; their leftover values must not block the export.
+        copy = self.copy_selected()
         return Edit(self.start.value(), self.end.value(), self.encoder.currentData(), self.bitrate.value(),
-                    audio, self.crop, *self.colors, remix=self.remix.isChecked(), resolution=self.resolution.currentData(), fps=self.export_fps.currentData(), upscale=self.upscale.isChecked(),
+                    audio, self.crop, *self.colors, remix=self.remix.isChecked(),
+                    resolution=None if copy else self.resolution.currentData(),
+                    fps=0 if copy else self.export_fps.currentData(),
+                    upscale=False if copy else self.upscale.isChecked(),
                     mutes={index: list(ranges) for index, ranges in self.mutes.items() if ranges})
 
     def region_changed(self, region):
@@ -665,28 +673,31 @@ class Editor(DesktopWindow):
         self.delete_preset.setEnabled(self.preset.currentData() in self.prefs['export_presets'])
 
     def export_ready(self):
-        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        audio = self.audio_export()
         return self.info is not None and (audio or self.encoder.currentData() in self.available_export_encoders) and not self.busy()
 
     def export_format_changed(self, *_):
         self.prefs['export_format'] = self.export_format.currentData()
         self.save_prefs()
-        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        audio = self.audio_export()
         for control in (self.encoder, self.bitrate, self.resolution, self.export_fps, self.upscale):
             control.setEnabled(not audio)
         self.update_copy_controls()
         self.export_button.setEnabled(self.export_ready())
         self.update_size_estimate()
 
+    def audio_export(self):
+        return self.export_format.currentData() in AUDIO_FORMATS
+
     def copy_selected(self):
-        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        audio = self.audio_export()
         return not audio and self.encoder.currentData() == COPY
 
     def update_copy_controls(self):
         """Copy passes video through untouched, so video-processing options do not apply."""
         if not hasattr(self, 'upscale'):
             return
-        audio = self.export_format.currentData() in ('mp3', 'm4a', 'wav', 'flac')
+        audio = self.audio_export()
         copy = self.copy_selected()
         for control in (self.bitrate, self.resolution, self.export_fps, self.upscale):
             control.setEnabled(not audio and not copy)
@@ -960,6 +971,7 @@ class Editor(DesktopWindow):
 
     def loaded(self, result):
         self.last_export_path = None
+        self.preview_export_button.setEnabled(True)
         # A finished bar belongs to the previous clip; 100% here looked like this clip was exported.
         self.progress.setValue(0)
         self.eta.reset()
@@ -1049,9 +1061,6 @@ class Editor(DesktopWindow):
         else:
             self.player.play()
 
-    def seek_step(self, step):
-        self.player.pause()
-        self.player.setPosition(max(0, min(self.scrub.maximum(), self.player.position()+step)))
 
     def mark_start(self):
         self.start.setValue(self.player.position()/1000)
@@ -1206,9 +1215,7 @@ class Editor(DesktopWindow):
             if not job.wait(5000):
                 self.status.setText('Stopping waveform analysis; close again in a moment.')
                 return False
-        self.player.stop()
-        self.video.frame_timer.stop()
-        self.video.pending_frame = None
+        self.release_media()
         if self.preview_temp:
             try:
                 self.preview_temp.cleanup()
@@ -1222,3 +1229,26 @@ class Editor(DesktopWindow):
             event.accept()
         else:
             event.ignore()
+
+    def release_media(self):
+        """Let go of the clip file. A stopped player still holds it open, which blocked Recycle Bin moves."""
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.video.frame_timer.stop()
+        self.video.pending_frame = None
+
+    def release_file(self, path):
+        """The gallery is deleting this clip; release it if it is the one loaded here."""
+        from .desktop import same_file
+        if self.info and same_file(self.info['path'], path):
+            self.release_media()
+            self.status.setText('This clip was moved to the Recycle Bin. Open another clip to continue.')
+            self.export_button.setEnabled(False)
+            self.preview_export_button.setEnabled(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Reopening the editor restores the clip released when it was closed.
+        if self.info and self.player.source().isEmpty() and Path(self.info['path']).is_file():
+            self.player.setSource(QUrl.fromLocalFile(self.info['path']))
+            self.player.pause()

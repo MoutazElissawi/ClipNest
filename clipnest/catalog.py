@@ -15,6 +15,17 @@ KNOWN_GAMES = {"valorant-win64-shipping.exe": "Valorant", "valorant.exe": "Valor
                "osu!.exe": "osu!", "helldivers2.exe": "Helldivers 2", "rocketleague.exe": "Rocket League",
                "marvel-win64-shipping.exe": "Marvel Rivals", "chivalry2-win64-shipping.exe": "Chivalry 2",
                "geometrydash.exe": "Geometry Dash"}
+# Exact window titles for protected games that deny both process name and path.
+KNOWN_TITLES = {'helldivers 2': 'Helldivers 2', 'valorant': 'Valorant',
+                'rocket league': 'Rocket League', 'osu!': 'osu!'}
+# Fullscreen windows that are never games: browsers, players, overlays and shell.
+NOT_GAMES = {"chrome.exe", "msedge.exe", "firefox.exe", "opera.exe", "opera_gx.exe", "brave.exe", "vivaldi.exe",
+             "arc.exe", "iexplore.exe", "vlc.exe", "mpc-hc64.exe", "mpc-be64.exe", "potplayermini64.exe", "mpv.exe",
+             "wmplayer.exe", "video.ui.exe", "applicationframehost.exe", "discord.exe", "spotify.exe", "obs64.exe",
+             "steamwebhelper.exe", "steam.exe", "epicgameslauncher.exe", "gameoverlayui.exe", "nvidia overlay.exe",
+             "nvsphelper64.exe", "gamebar.exe", "gamebarftserver.exe", "explorer.exe", "searchhost.exe",
+             "startmenuexperiencehost.exe", "shellexperiencehost.exe", "lockapp.exe", "textinputhost.exe",
+             "powerpnt.exe", "teams.exe", "ms-teams.exe", "zoom.exe"}
 RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
@@ -215,8 +226,7 @@ class Catalog:
             # game titles then, never browser/document titles containing game names.
             if category == 'Desktop' and not app.get('name') and not app.get('exe'):
                 title = app.get('title', '').casefold().replace('™', '').strip()
-                category = {'helldivers 2': 'Helldivers 2', 'valorant': 'Valorant',
-                            'rocket league': 'Rocket League', 'osu!': 'osu!'}.get(title, 'Desktop')
+                category = KNOWN_TITLES.get(title, 'Desktop')
             self.last = {**app, "category": category}
             self.last_seen = now
         elif now - self.last_seen > 3:
@@ -225,6 +235,25 @@ class Catalog:
         while len(self.history) > 1 and self.history[1][0] < now - 3600:
             self.history.popleft()
         return dict(self.last)
+
+    def game_category(self, app, window):
+        """Game name for the focused window, or None for the desktop and other apps.
+
+        Known, mapped and Steam/Epic games always count. An unknown program counts
+        only while it covers its monitor and is not a browser, player or overlay.
+        """
+        if not app or (window or {}).get('pid') == os.getpid():
+            return None
+        exe, name = app.get('exe', ''), app.get('name', '')
+        category = self.classify(exe, name)
+        if category == 'Desktop' and not name and not exe:
+            category = KNOWN_TITLES.get(app.get('title', '').casefold().replace('™', '').strip(), 'Desktop')
+        if category != 'Desktop':
+            return category
+        basename = name or exe.replace('\\', '/').rsplit('/', 1)[-1]
+        if basename and (window or {}).get('fullscreen') and basename.casefold() not in NOT_GAMES:
+            return Path(basename).stem
+        return None
 
     def replay_app(self, seconds):
         """Use foreground time within the requested footage, not just save-time focus."""

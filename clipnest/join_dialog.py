@@ -1,6 +1,6 @@
 from pathlib import Path
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
-    QPushButton, QComboBox, QCheckBox, QProgressBar, QFileDialog, QMessageBox, QSpinBox)
+    QPushButton, QComboBox, QCheckBox, QProgressBar, QFileDialog, QSpinBox)
 from .editor import Job
 from .media import probe, available_encoders, ExportETA
 from .gallery import gallery_tools

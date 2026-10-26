@@ -172,3 +172,9 @@ class SmoothList(QListWidget):
     def focusInEvent(self, event):
         self.keyboard_focus = event.reason() in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason)
         super().focusInEvent(event)
+
+
+def same_file(a, b):
+    """Same path on Windows, ignoring case and relative parts."""
+    import os
+    return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))

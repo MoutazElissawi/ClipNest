@@ -10,16 +10,16 @@ import tempfile
 import threading
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QTimer, QFile, QPointF
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QDesktopServices, QShortcut, QKeySequence, QImage, QGuiApplication, QPolygonF, QPen
-from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QMediaMetaData, QVideoSink
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QShortcut, QKeySequence, QImage, QGuiApplication, QPolygonF, QPen
+from PySide6.QtMultimedia import QMediaPlayer, QMediaMetaData, QVideoSink
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QListWidget, QListWidgetItem, QListView, QMainWindow, QSlider, QMessageBox, QLineEdit, QCheckBox, QInputDialog, QComboBox)
+    QPushButton, QListWidget, QListWidgetItem, QListView, QSlider, QMessageBox, QLineEdit, QCheckBox, QInputDialog, QComboBox)
 from .config import DATA
 from .editor_assets import thumbnail, captured_file
 from .media import tools_path
 from .preview import VIDEO_EXTENSIONS, VideoCanvas
 from .theme import apply_theme
-from .desktop import SmoothList, DefaultAudioOutput, show_centered, reveal_file, SeekSlider
+from .desktop import SmoothList, DefaultAudioOutput, show_centered, reveal_file, SeekSlider, same_file
 from .window_frame import DesktopWindow
 from .library import Annotations, matches, linked
 
@@ -216,6 +216,7 @@ class RecentGallery(QWidget):
         self.root, self.worker = Path(root), None
         self.clips, self.items = [], {}
         self.pending = self.stopped = False
+        self.pending_deletes = set()
         self.clip_limit = 24
         self.has_more = False
         layout = QVBoxLayout(self)
@@ -346,30 +347,76 @@ class RecentGallery(QWidget):
             except OSError as exc:
                 QMessageBox.warning(self, 'Open file location', str(exc))
 
+    def mark_deleting(self, item, on):
+        """Red border on the card being deleted, so it is clear which clip goes."""
+        if on:
+            from PySide6.QtCore import QRectF
+            item.setData(DELETE_ICON_ROLE, item.icon())
+            size = self.list.iconSize()
+            picture = item.icon().pixmap(size)
+            painter = QPainter(picture)
+            painter.setPen(QPen(QColor('#e53935'), 6))
+            painter.drawRect(QRectF(3, 3, size.width() - 6, size.height() - 6))
+            painter.end()
+            item.setIcon(QIcon(picture))
+        elif item.data(DELETE_ICON_ROLE) is not None:
+            item.setIcon(item.data(DELETE_ICON_ROLE))
+            item.setData(DELETE_ICON_ROLE, None)
+
+    def release_clip(self, path):
+        """The editor or quick player may still hold the file open; Windows then refuses the move."""
+        owner = self.window()
+        for name in ('editor', 'quick_player'):
+            holder = getattr(owner, name, None)
+            if holder is not None and hasattr(holder, 'release_file'):
+                holder.release_file(path)
+
     def delete_selected(self):
         selected = self.list.selectedItems()
         if len(selected) != 1:
             return
-        path = Path(selected[0].data(Qt.ItemDataRole.UserRole))
+        item = selected[0]
+        path = Path(item.data(Qt.ItemDataRole.UserRole))
+        if str(path) in self.pending_deletes:
+            return
+        self.mark_deleting(item, True)
         answer = QMessageBox.question(self, 'Delete clip?',
             f'Move this clip to the Recycle Bin?\n\n{path.name}\n\n{path.parent}',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel)
         if answer != QMessageBox.StandardButton.Yes:
+            self.mark_deleting(item, False)
             return
         # Never fall back to permanent removal when trash is unavailable.
-        try:
-            if path.is_symlink() or not path.is_file():
-                raise OSError('The clip is missing or is no longer a regular file.')
-            result = QFile.moveToTrash(str(path))
-            success = result[0] if isinstance(result, tuple) else result
-            if not success:
-                raise OSError('Could not move the clip to the Recycle Bin. Close it in the player/editor or other applications and try again.')
-        except OSError as error:
-            QMessageBox.warning(self, 'Clip was not deleted', str(error))
+        if path.is_symlink() or not path.is_file():
+            self.mark_deleting(item, False)
+            QMessageBox.warning(self, 'Clip was not deleted', 'The clip is missing or is no longer a regular file.')
             return
-        self.listed([clip for clip in self.clips if clip['path'] != str(path)], [])
-        self.refresh()
+        self.release_clip(path)
+        self.pending_deletes.add(str(path))
+        self.try_trash(path, 0)
+
+    def try_trash(self, path, attempt):
+        """Move to the Recycle Bin, retrying on a timer while players close the file (they do so asynchronously)."""
+        if self.stopped:
+            self.pending_deletes.discard(str(path))
+            return
+        result = QFile.moveToTrash(str(path))
+        if result[0] if isinstance(result, tuple) else result:
+            self.pending_deletes.discard(str(path))
+            self.listed([clip for clip in self.clips if clip['path'] != str(path)], [])
+            self.refresh()
+            return
+        if attempt < DELETE_RETRIES:
+            QTimer.singleShot(DELETE_RETRY_MS, self, lambda: self.try_trash(path, attempt + 1))
+            return
+        # Never fall back to permanent removal when trash is unavailable.
+        self.pending_deletes.discard(str(path))
+        item = self.items.get(str(path))  # the list may have been redrawn while retrying
+        if item is not None:
+            self.mark_deleting(item, False)
+        QMessageBox.warning(self, 'Clip was not deleted',
+                            'Could not move the clip to the Recycle Bin. Another application may have it open; close it and try again.')
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -530,6 +577,10 @@ class RecentGallery(QWidget):
             self.worker.wait()
 
 
+DELETE_ICON_ROLE = Qt.ItemDataRole.UserRole + 7
+DELETE_RETRIES, DELETE_RETRY_MS = 9, 100  # about one second for a player to close the file
+
+
 class QuickPlayer(DesktopWindow):
     edit_requested = Signal(str)
     def __init__(self, parent=None):
@@ -626,6 +677,13 @@ class QuickPlayer(DesktopWindow):
         self.player.errorOccurred.connect(lambda *_: self.message.setText('Playback failed: '+self.player.errorString()))
         QShortcut(QKeySequence('Space'), self, activated=self.toggle)
         QShortcut(QKeySequence('Escape'), self, activated=self.close)
+
+    def release_file(self, path):
+        """Stop and release the clip if the gallery is deleting the one shown here."""
+        if 0 <= self.index < len(self.clips) and same_file(self.clips[self.index]['path'], path):
+            self.player.stop()
+            self.player.setSource(QUrl())
+            self.message.setText('This clip was moved to the Recycle Bin.')
 
     def open_clips(self, clips, index):
         self.clips = [dict(c) for c in clips]

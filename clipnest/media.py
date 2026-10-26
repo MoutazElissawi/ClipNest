@@ -189,10 +189,13 @@ def export_args(info, edit, ffmpeg, destination):
     copy = edit.encoder == COPY and not audio_codec
     if not audio_codec and not copy and (edit.encoder not in ENCODERS or not 1000 <= edit.bitrate <= 200000):
         raise ValueError('Choose an available encoder and valid bitrate.')
-    if copy and (edit.crop or edit.resolution or edit.fps or edit.upscale
-                 or (edit.brightness, edit.contrast, edit.saturation) != (0.0, 1.0, 1.0)):
-        raise ValueError('Copy keeps the original video untouched, so crop, color, resolution and FPS changes '
-                         'cannot be applied. Reset them or choose an encoder.')
+    blocking = [name for name, active in (
+        ('crop (Filters → Reset filters)', edit.crop),
+        ('color changes (Filters → Reset filters)', (edit.brightness, edit.contrast, edit.saturation) != (0.0, 1.0, 1.0)),
+        ('resolution', edit.resolution), ('FPS', edit.fps), ('upscaling', edit.upscale)) if active]
+    if copy and blocking:
+        raise ValueError('Copy keeps the original video untouched, so it cannot apply your '
+                         + ' and '.join(blocking) + '. Reset that, or choose an encoder to re-encode.')
     dest, source = Path(destination), Path(info['path'])
     if dest.resolve() == source.resolve() or (dest.exists() and source.exists() and dest.samefile(source)):
         raise ValueError('Export must use a new filename; the original is protected.')

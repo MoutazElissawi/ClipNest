@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import ctypes
 from ctypes import wintypes
 import math
 import logging
@@ -9,11 +8,11 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QAbstractNativeEventFilter, QUrl, QSize
-from PySide6.QtGui import QDesktopServices, QAction, QIcon
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTabWidget, QGroupBox, QFormLayout, QLineEdit, QSpinBox,
-    QComboBox, QSlider, QProgressBar, QPlainTextEdit, QFileDialog, QMessageBox,
-    QListWidget, QListWidgetItem, QInputDialog, QSystemTrayIcon, QMenu, QScrollArea, QCheckBox, QLayout, QSizePolicy)
+from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QTabWidget, QGroupBox, QFormLayout, QLineEdit, QSpinBox, QComboBox,
+    QSlider, QProgressBar, QPlainTextEdit, QFileDialog, QMessageBox, QInputDialog,
+    QSystemTrayIcon, QMenu, QScrollArea, QCheckBox, QLayout, QSizePolicy)
 
 from .config import DATA, ENCODERS, save_appearance as persist_appearance
 from . import __version__
@@ -397,6 +396,7 @@ class Window(DesktopWindow):
         self.replay_mode.setCurrentIndex(self.replay_mode.findData(self.settings.get('replay_mode', 'continuous')))
         form.addRow('Replay behavior', self.replay_mode)
         self.capture_target = QComboBox()
+        self.capture_target.addItem("Games only · never the desktop or other apps", "games")
         self.capture_target.addItem("Entire display", "display")
         self.capture_target.addItem("All displays · stitched into one video", "displays")
         self.capture_target.addItem("Individual window", "window")
@@ -417,6 +417,12 @@ class Window(DesktopWindow):
                                    'This adds OBS game capture above the display while a fullscreen game on this monitor has focus. '
                                    'Display capture and your method choice stay unchanged.')
         form.addRow('', self.game_layer)
+        self.game_audio_only = QCheckBox("Record only the game's audio")
+        self.game_audio_only.setChecked(self.settings.get('game_audio_only', False))
+        self.game_audio_only.setToolTip('Off (default): the Mix and Desktop tracks record everything you hear. '
+                                        'On: they record only the game, so browsers, music and calls stay out of clips. '
+                                        'The microphone track is unchanged. Needs Windows 10 version 2004 or newer.')
+        form.addRow('', self.game_audio_only)
         self.capture_window = QComboBox()
         self.capture_window.setMinimumContentsLength(20)
         self.capture_window.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -813,6 +819,12 @@ class Window(DesktopWindow):
             capture += " + game hook"
         if data.get("capture_target", "display") in ("window", "game"):
             capture = "Window capture" + (" active" if data.get("capture_attached") else " idle")
+        if data.get("capture_target") == "games":
+            game = data.get("game")
+            capture = (f"Game capture · {game}" + ("" if data.get("game_visible") else " minimized, recording black")
+                       if game else "Game capture · waiting for a game")
+            if data.get("game_audio"):
+                capture += " · game audio only"
         self.status.setText(f"{'Replay ON' if self.replay else 'Replay off'}  •  {recording}  •  {capture}")
         seconds, buffered = data["replay_seconds"], data.get("buffered")
         warmup = f" • Buffer warming up: {min(int(buffered), seconds)} / {seconds}s" if self.replay and buffered is not None and buffered < seconds else ""
@@ -821,9 +833,11 @@ class Window(DesktopWindow):
 
     def update_capture_controls(self, *_):
         window = self.capture_target.currentData() in ("window", "game")
-        self.monitor.setEnabled(not window and self.capture_target.currentData() != "displays")
-        self.capture_method.setEnabled(not window)
-        self.game_layer.setVisible(not window)
+        display = self.capture_target.currentData() in ("display", "displays")
+        self.monitor.setEnabled(self.capture_target.currentData() == "display")
+        self.capture_method.setEnabled(display)
+        self.game_layer.setVisible(display)
+        self.game_audio_only.setVisible(self.capture_target.currentData() == "games")
         self.capture_window.setEnabled(window)
         self.window_method.setEnabled(self.capture_target.currentData() == "window")
         self.window_options.setVisible(window)
@@ -959,7 +973,8 @@ class Window(DesktopWindow):
             data.update(output=self.output.text().strip(), storage_limit_gb=self.storage_limit.value(), replay_seconds=self.seconds.value(), replay_mode=self.replay_mode.currentData(),
                         encoder=self.encoder.currentText(), nvenc_preset=self.nvenc_preset.currentData(), capture_method=self.capture_method.currentData(), width=self.width.value(), height=self.height.value(),
                         capture_target=self.capture_target.currentData(), window_value=self.capture_window.currentData() or "", window_method=self.window_method.currentData(),
-                        game_layer=self.game_layer.isChecked(), app_audio=self.app_audio.currentData() or "",
+                        game_layer=self.game_layer.isChecked(), game_audio_only=self.game_audio_only.isChecked(),
+                        app_audio=self.app_audio.currentData() or "",
                         fps=int(self.fps.currentText()), bitrate=self.bitrate.value(),
                         audio_bitrate=self.audio_bitrate.currentData(), mic_bitrate=self.mic_bitrate.currentData(),
                         mic_device=self.mic.currentData() or self.settings["mic_device"],

@@ -5,8 +5,9 @@ import os
 import logging
 import time
 from PySide6.QtCore import QObject, QTimer
-from PySide6.QtWidgets import QApplication
 from PySide6.QtMultimedia import QMediaDevices
+
+from .engine import DISPLAY_CHANGED
 
 
 class SystemEvents(QObject):
@@ -121,7 +122,7 @@ class SystemEvents(QObject):
                 self.locked = False
                 self.queue_resume('Windows session unlocked')
         elif message == 0x007E:  # WM_DISPLAYCHANGE
-            self.queue_resume('Display configuration changed')
+            self.queue_resume(DISPLAY_CHANGED)
 
     def close(self):
         self.closed = True

@@ -25,7 +25,7 @@ def load_settings():
                     encoder="NVIDIA H.264", nvenc_preset="p4", mic_device="default", desktop_device="default",
                     audio_bitrate=192, mic_bitrate=192,
                     monitor_property="monitor_id", monitor_value=None, capture_method=2,
-                    capture_target="display", window_value="", window_method=2, game_layer=True, app_audio="", export_sound=True,
+                    capture_target="games", window_value="", window_method=2, game_layer=True, game_audio_only=False, app_audio="", export_sound=True,
                     mic_mode="Always on", mic_volume=100, ptt_key="F8",
                     replay_key="Ctrl+Shift+F10", record_key="Ctrl+Shift+F9",
                     games={}, ui_theme='dark', theme_file='', glass_tint=46, notifications_enabled=True, notification_corner='Top right',
@@ -123,14 +123,16 @@ def validate(s):
         raise ValueError('Glass tint must be between 25 and 85 percent.')
     if s.get("replay_mode", "classic") not in ("classic", "continuous"):
         raise ValueError("Choose a supported replay mode.")
-    if s.get("capture_target", "display") not in ("display", "displays", "window", "game"):
-        raise ValueError("Choose Display or Window capture.")
+    if s.get("capture_target", "display") not in ("games", "display", "displays", "window", "game"):
+        raise ValueError("Choose Games only, Display or Window capture.")
     if not isinstance(s.get("app_audio", ""), str) or (s.get("app_audio") and len(s["app_audio"].split(":")) != 3):
         raise ValueError("Choose a valid application for the extra audio track.")
     if type(s.get("export_sound", True)) is not bool:
         raise ValueError("Export sound must be on or off.")
     if type(s.get("game_layer", True)) is not bool:
         raise ValueError("Game layer must be on or off.")
+    if type(s.get("game_audio_only", False)) is not bool:
+        raise ValueError("Game-only audio must be on or off.")
     if s.get("window_method", 2) not in (0, 1, 2):
         raise ValueError("Choose a supported window capture method.")
     if not isinstance(s.get("window_value", ""), str):

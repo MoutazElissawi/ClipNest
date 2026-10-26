@@ -302,10 +302,6 @@ def _transparency_blocker():
     return ''
 
 
-def _transparency_allowed():
-    return not _transparency_blocker()
-
-
 def _accent_blur(hwnd, enabled):
     """Windows 10 compatibility path. ACCENT_POLICY is undocumented; failure is safe.
 

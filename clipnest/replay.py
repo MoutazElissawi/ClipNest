@@ -87,10 +87,6 @@ def segment_timing(path, ffprobe, cancel=None):
     return max(stamps)-min(stamps)+1/rate, min(stamps)
 
 
-def segment_duration(path, ffprobe):
-    return segment_timing(path, ffprobe)[0]
-
-
 def concat_segments(segments, ffmpeg, destination, cancel=None):
     """Copy encoded packets, preserving all audio tracks and explicit video spans."""
     destination = Path(destination)
