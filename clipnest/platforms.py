@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 
 WINDOWS = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
@@ -30,6 +31,10 @@ ENCODER_FALLBACKS = {"obs_nvenc_h264_tex": ("jim_nvenc", "ffmpeg_nvenc"),
 # Windows hooks; X11 window capture and Wayland window picking are later work.
 LINUX_TARGETS = ("display",)
 LINUX_AUDIO = {"wasapi_output_capture": "pulse_output_capture", "wasapi_input_capture": "pulse_input_capture"}
+# Each source of this kind is its own xdg-desktop-portal screen-share request.
+WAYLAND_SCREEN = "pipewire-screen-capture-source"
+# Long enough to pick a screen in the portal's dialog; the host's RPC timeout is 30 s.
+PORTAL_WAIT_SECONDS = 25
 LINUX_MODULES = ("linux-capture", "linux-pipewire", "linux-pulseaudio", "obs-ffmpeg", "obs-x264", "obs-nvenc")
 # OBS installs libobs and its plugin folder in one library folder of its prefix, and its data in share/obs.
 LIB_SUBDIRS = ("lib/x86_64-linux-gnu", "lib64", "lib")
@@ -57,7 +62,7 @@ def source_kind(kind, env=None):
     if not LINUX:
         return kind
     if kind == "monitor_capture":
-        return "pipewire-screen-capture-source" if wayland(env) else "xshm_input"
+        return WAYLAND_SCREEN if wayland(env) else "xshm_input"
     return LINUX_AUDIO.get(kind, kind)
 
 
@@ -237,6 +242,23 @@ def open_display(platform):
     if not display:
         raise RuntimeError("Could not connect to the desktop session's display. Start ClipNest from your desktop, not a plain terminal or SSH.")
     return display
+
+
+def run_glib_loop():
+    """Dispatch GLib's default main context on a daemon thread; returns the thread.
+
+    OBS's PipeWire capture talks to xdg-desktop-portal over GDBus, whose replies arrive as
+    callbacks on that context. OBS Studio's Qt loop runs it; the host has no such loop, so
+    without this every screen-share request stalls before the portal shows its dialog.
+    """
+    glib = ctypes.CDLL(ctypes.util.find_library("glib-2.0") or "libglib-2.0.so.0")
+    glib.g_main_loop_new.restype = ctypes.c_void_p
+    glib.g_main_loop_new.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    glib.g_main_loop_run.argtypes = [ctypes.c_void_p]
+    loop = glib.g_main_loop_new(None, 0)
+    thread = threading.Thread(target=glib.g_main_loop_run, args=(loop,), name="ClipNest GLib", daemon=True)
+    thread.start()
+    return thread
 
 
 def x11_compositor_owner():

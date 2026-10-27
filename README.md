@@ -17,8 +17,8 @@ Instant replay and screen recording, using your distribution's OBS Studio as the
 ## Install
 
 ```sh
-tar xzf ClipNest-2.1.3-linux-x64.tar.gz
-cd ClipNest-2.1.3-linux-x64
+tar xzf ClipNest-2.1.4-linux-x64.tar.gz
+cd ClipNest-2.1.4-linux-x64
 ./install.sh
 ```
 

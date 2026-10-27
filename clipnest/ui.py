@@ -466,13 +466,17 @@ class Window(DesktopWindow):
         for label, value in [('Fastest · P1', 'p1'), ('Efficient · P3', 'p3'), ('Balanced · P4', 'p4'), ('Quality · P5', 'p5')]:
             self.nvenc_preset.addItem(label, value)
         self.nvenc_preset.setCurrentIndex(self.nvenc_preset.findData(self.settings.get('nvenc_preset', 'p4')))
-        self.nvenc_preset.setEnabled(self.encoder.currentText().startswith('NVIDIA'))
-        self.encoder.currentTextChanged.connect(lambda value: self.nvenc_preset.setEnabled(value.startswith('NVIDIA')))
         form.addRow('NVIDIA effort', self.nvenc_preset)
         effort_note = QLabel('Lower presets reduce encoder work at a quality cost. Resolution and frame rate also affect load. Replay and recording share one encoder.')
         effort_note.setWordWrap(True)
         effort_note.setObjectName('muted')
         form.addRow(effort_note)
+        def show_effort(encoder, form=form):  # form is reassigned for later sections
+            # Only NVENC has an effort preset; OBS's VAAPI encoder defines none.
+            for widget in (self.nvenc_preset, effort_note):
+                form.setRowVisible(widget, encoder.startswith('NVIDIA'))
+        self.encoder.currentTextChanged.connect(show_effort)
+        show_effort(self.encoder.currentText())
         resolution = QHBoxLayout()
         self.width = self.spin(64, 4096, self.settings['width'])
         self.height = self.spin(64, 4096, self.settings['height'])

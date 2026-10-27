@@ -71,6 +71,8 @@ class NativeEngine:
             nix = platforms.OBS_NIX_PLATFORM_WAYLAND if platforms.wayland() else platforms.OBS_NIX_PLATFORM_X11_EGL
             l.obs_set_nix_platform(nix)
             l.obs_set_nix_platform_display(P(platforms.open_display(nix)))
+            if nix == platforms.OBS_NIX_PLATFORM_WAYLAND:
+                platforms.run_glib_loop()  # the screen-share portal answers through GLib
             print(f"OBS {decode(l.obs_get_version_string())} from {layout['library']}; "
                   f"{'Wayland' if nix == platforms.OBS_NIX_PLATFORM_WAYLAND else 'X11'} session", file=sys.stderr, flush=True)
         if not l.obs_startup(b"en-US", obs_path(config_dir), None):
@@ -143,6 +145,14 @@ class NativeEngine:
             return
         names = [n for n in self.input_settings if n == 'CN Screen' or n.startswith('CN Screen ')]
         for name in names:
+            source, kind = self.inputs[name]
+            if kind == platforms.WAYLAND_SCREEN:
+                # A new PipeWire source is a new portal request: it cancels a dialog still
+                # open and asks again. Keep a screen the user already shared.
+                if self.lib.obs_source_get_width(source) > 0:
+                    continue
+                # The portal's restore tokens are single-use; ask with the newest one.
+                self.input_settings[name] = {**self.input_settings[name], **self.lib.source_settings(source)}
             self.refresh_screen(name)
 
     def refresh_screen(self, name):
@@ -184,8 +194,19 @@ class NativeEngine:
             return
         # Let the graphics thread activate the source before checking its size.
         time.sleep(.1)
-        if (self.capture_ready(timeout=10) if self.settings.get("capture_target") == "game" else self.capture_ready()):
+        portal = self.inputs.get("CN Screen", (None, None))[1] == platforms.WAYLAND_SCREEN
+        if portal:
+            ready = self.capture_ready(timeout=platforms.PORTAL_WAIT_SECONDS)
+        else:
+            ready = self.capture_ready(timeout=10) if self.settings.get("capture_target") == "game" else self.capture_ready()
+        if ready:
             return
+        if portal:
+            self.lib.obs_set_output_source(0, None)
+            self.capture_attached = False
+            raise RuntimeError("No screen was shared. Pick a screen in the screen-sharing dialog, then start again. "
+                               "If no dialog appears, check that xdg-desktop-portal and your desktop's portal "
+                               "(for example xdg-desktop-portal-hyprland, -kde, -gnome or -wlr) are running. Recording was not started.")
         if self.settings.get("capture_target") in ("window", "game"):
             raise RuntimeError("The selected game/window did not produce video. Restore the game and check that ClipNest and the game use the same privileges. For osu!, try Game capture or Window capture with BitBlt and osu! compatibility mode. Check native-engine.log for hook/capture errors. Recording was not started.")
         if self.settings.get('capture_method') == 1:
