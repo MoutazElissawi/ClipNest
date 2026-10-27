@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QLockFile
+from PySide6.QtCore import QLockFile, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from clipnest.config import DATA, SETTINGS, load_settings, atomic_json
@@ -14,6 +14,10 @@ from clipnest import __version__, platforms
 
 
 def main():
+    if platforms.LINUX and "--check-obs" in sys.argv:
+        ok, report = platforms.obs_report()
+        print(f"ClipNest {__version__} recording check\n{report}")
+        return 0 if ok else 1
     preview = "--preview" in sys.argv
     if not preview:
         from clipnest.install_support import hold_install_mutex
@@ -22,6 +26,13 @@ def main():
     platforms.choose_qt_audio_backend()
     app = QApplication(sys.argv)
     app.setApplicationName("ClipNest")
+    if platforms.LINUX:
+        # ClipNest draws its own theme: keep desktop style plugins (QT_STYLE_OVERRIDE) out, and
+        # skip popup animations that copy the screen, which Wayland does not allow.
+        app.setStyle("Fusion")
+        for effect in (Qt.UIEffect.UI_AnimateMenu, Qt.UIEffect.UI_FadeMenu, Qt.UIEffect.UI_AnimateCombo,
+                       Qt.UIEffect.UI_AnimateTooltip, Qt.UIEffect.UI_FadeTooltip):
+            app.setEffectEnabled(effect, False)
     app.setWindowIcon(app_icon())
     app.setQuitOnLastWindowClosed(False)
     DATA.mkdir(parents=True, exist_ok=True)

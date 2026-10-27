@@ -579,7 +579,9 @@ class Window(DesktopWindow):
         palette_note.setWordWrap(True)
         palette_note.setObjectName('muted')
         form.addRow(palette_note)
-        glass_note = QLabel('Glass reveals windows behind ClipNest with a dark tint and native blur. Windows Transparency effects must be enabled. Drag the title bar to move, double-click to maximize, or drag any edge/corner to resize. Classic restores the standard title bar after restart. If needed, launch with --safe-ui.')
+        effect = ('Glass shows your desktop through ClipNest with a dark tint. Desktops that blur transparent windows, such as Hyprland, frost it; others show it clearly. '
+                  if platforms.LINUX else 'Glass reveals windows behind ClipNest with a dark tint and native blur. Windows Transparency effects must be enabled. ')
+        glass_note = QLabel(effect + 'Drag the title bar to move, double-click to maximize, or drag any edge/corner to resize. Classic restores the standard title bar after restart. If needed, launch with --safe-ui.')
         glass_note.setWordWrap(True)
         glass_note.setObjectName('muted')
         form.addRow(glass_note)
@@ -601,7 +603,8 @@ class Window(DesktopWindow):
         self.appearance_saved.setWordWrap(True)
         self.appearance_saved.setObjectName('muted')
         form.addRow(self.appearance_saved)
-        form.addRow(self.button('Open Windows transparency settings', lambda: QDesktopServices.openUrl(QUrl('ms-settings:colors')), 'quiet'))
+        if not platforms.LINUX:
+            form.addRow(self.button('Open Windows transparency settings', lambda: QDesktopServices.openUrl(QUrl('ms-settings:colors')), 'quiet'))
         form.addRow(self.button('Refresh glass effect', self.refresh_backdrop, 'quiet'))
         form.addRow(self.button('Open running ClipNest folder', lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1]))), 'quiet'))
 

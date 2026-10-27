@@ -5,17 +5,20 @@ Instant replay and screen recording, using your distribution's OBS Studio as the
 ## Requirements
 
 - 64-bit x86 Linux with Python 3.10 or newer (and `python3-venv` on Debian/Ubuntu)
-- **OBS Studio 30 or newer from your distribution's packages**. The Flatpak keeps its libraries in a sandbox where ClipNest cannot load them.
-  - Debian/Ubuntu: `sudo apt install obs-studio python3-venv`
+- **OBS Studio 30 or newer from your distribution's packages**. A Flatpak or Snap OBS keeps its libraries in a sandbox where ClipNest cannot load them. It can stay installed next to the distribution package.
+  - Debian/Ubuntu/Mint: `sudo apt install obs-studio python3-venv`
   - Fedora: `sudo dnf install obs-studio`
   - Arch: `sudo pacman -S obs-studio`
-- Optional: `ffmpeg`, for the clip editor's exports. Recording does not need it.
+  - openSUSE: `sudo zypper install obs-studio`
+  - Void: `sudo xbps-install obs`
+- Wayland: `xdg-desktop-portal` with your desktop's backend (KDE, GNOME, wlr or Hyprland). Most desktops install it already.
+- Optional: `ffmpeg`, for the clip editor's exports. Recording does not need it. The editor does not use OBS, so an editor that works says nothing about OBS.
 
 ## Install
 
 ```sh
-tar xzf ClipNest-2.1.1-linux-x64.tar.gz
-cd ClipNest-2.1.1-linux-x64
+tar xzf ClipNest-2.1.2-linux-x64.tar.gz
+cd ClipNest-2.1.2-linux-x64
 ./install.sh
 ```
 
@@ -55,7 +58,16 @@ Run it again to update. `./uninstall.sh` removes the app and keeps your settings
 - **Games only**, window capture and game capture: these use Windows game hooks. On Linux, record the display.
 - Game-only audio and the per-application audio track.
 
+**Frosted glass.** On Linux, Glass makes the window see-through with a dark tint. Desktops that blur transparent windows, such as Hyprland, frost it; GNOME and KDE show your desktop clearly behind the tint. Raise **Glass tint** in Settings → Appearance for a darker window. On X11, Glass needs a compositor (built into GNOME, KDE and Xfce); without one it stays opaque.
+
 ## Troubleshooting
 
-- **"OBS Studio was not found"**: install the distribution package above. If OBS is installed under a custom prefix, start ClipNest with `CLIPNEST_OBS_PREFIX=/that/prefix`.
+- **Check what ClipNest finds.** Run this in a terminal and share the output when asking for help:
+
+  ```sh
+  ~/.local/bin/clipnest --check-obs
+  ```
+
+  It shows where ClipNest looked for OBS, the OBS version, the plugins it needs and, on Wayland, whether the screen-sharing portal is there.
+- **"OBS Studio … was not found"**: install the distribution package above. ClipNest looks next to the `obs` command, in the system library cache, and in `/usr`, `/usr/local` and `/opt/obs-studio`. If OBS is somewhere else, start ClipNest with `CLIPNEST_OBS_PREFIX=/that/prefix`.
 - Logs are in `~/.local/share/ClipNest/clipnest.log` and `native-engine.log`.

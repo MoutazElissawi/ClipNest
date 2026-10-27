@@ -20,18 +20,15 @@ command -v "$PYTHON" >/dev/null 2>&1 || fail "Python 3.10 or newer is required (
 "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))' || fail "Python 3.10 or newer is required; found $("$PYTHON" -V 2>&1)."
 "$PYTHON" -c 'import venv, ensurepip' 2>/dev/null || fail "Python's venv module is missing. Debian/Ubuntu: sudo apt install python3-venv"
 
-# Recording uses your distribution's OBS Studio 30+ (not the Flatpak, whose libraries live in a sandbox).
-OBS_FOUND=
-for dir in /usr/lib/x86_64-linux-gnu/obs-plugins /usr/lib64/obs-plugins /usr/lib/obs-plugins \
-           /usr/local/lib/x86_64-linux-gnu/obs-plugins /usr/local/lib64/obs-plugins /usr/local/lib/obs-plugins; do
-    [ -d "$dir" ] && OBS_FOUND=$dir && break
-done
-if [ -n "${CLIPNEST_OBS_PREFIX:-}" ]; then OBS_FOUND=$CLIPNEST_OBS_PREFIX; fi
-if [ -z "$OBS_FOUND" ]; then
-    say "WARNING: OBS Studio was not found. ClipNest installs, but recording needs OBS Studio 30 or newer:"
-    say "  Debian/Ubuntu: sudo apt install obs-studio     Fedora: sudo dnf install obs-studio"
-    say "  Arch: sudo pacman -S obs-studio"
-fi
+# Recording uses your distribution's OBS Studio 30+ (a Flatpak or Snap OBS keeps its libraries in
+# its sandbox). This is the same search ClipNest runs when it starts.
+(cd "$HERE" && "$PYTHON" -c '
+from clipnest import platforms
+try:
+    platforms.obs_layout()
+except RuntimeError as error:
+    print("WARNING: ClipNest installs, but recording needs OBS Studio 30 or newer.\n" + str(error) + "\n")
+') || true
 command -v ffmpeg >/dev/null 2>&1 || say "Note: install ffmpeg to use the clip editor's exports (recording does not need it)."
 
 say "Installing ClipNest into $PREFIX ..."

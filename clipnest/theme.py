@@ -1,5 +1,6 @@
 """Shared desktop theme."""
 from pathlib import Path
+from . import platforms
 STYLE = """
 QWidget { background: #191919; color: #efefef; font-family: 'Segoe UI'; font-size: 10pt; }
 QMainWindow, QDialog { background: #191919; }
@@ -259,6 +260,35 @@ def normalize_theme(value):
     return value if value in ("dark", "glass") else "dark"
 
 
+# Linux draws combo boxes with Fusion, whose popup mode paints a menu panel from the desktop
+# palette. Qt never applies window style sheets to that popup frame (QComboBoxPrivateContainer
+# is "unstylable"), so it showed light bars, or nothing, around the list. Linux uses a plain
+# list under the box, as on Windows, and each popup frame gets its own sheet.
+LINUX_STYLE = """
+QComboBox { combobox-popup: 0; }
+QComboBox QAbstractItemView::item { min-height: 26px; padding: 0 8px; }
+"""
+POPUP_FRAME = {'dark': 'QComboBoxPrivateContainer { background: #262626; border: 1px solid #555555; }',
+               'glass': 'QComboBoxPrivateContainer { background: #18231d; border: 1px solid #45574d; }'}
+
+
+def style_popup_frames(window):
+    from PySide6.QtWidgets import QComboBox, QStyledItemDelegate
+    sheet = POPUP_FRAME[normalize_theme(getattr(window, '_theme', 'dark'))]
+    for combo in window.findChildren(QComboBox):
+        if not isinstance(combo.itemDelegate(), QStyledItemDelegate):
+            combo.setItemDelegate(QStyledItemDelegate(combo))  # Qt's default ignores ::item rules
+        frame = combo.view().window()  # creates the popup frame early; Qt would on first open
+        if frame is not window and frame.styleSheet() != sheet:
+            frame.setStyleSheet(sheet)
+
+
+def glass_alpha(tint, blurred=True):
+    """Tint opacity 0-255. Without a native blur behind it, stay readable over a busy desktop."""
+    tint = max(25, min(85, int(tint)))
+    return round(255*tint/100) if blurred else round(255*(.65 + .3*(tint-25)/60))
+
+
 def theme_style(value):
     return GLASS_STYLE if normalize_theme(value) == "glass" else STYLE
 
@@ -377,8 +407,17 @@ def apply_native_backdrop(window, value):
     handle = window.windowHandle()
     if handle is None or not window.isVisible():
         return False  # Never create an HWND to apply an effect.
+    if platforms.LINUX:
+        # No Linux API blurs a Qt window everywhere; Hyprland and some KDE setups blur
+        # transparent windows themselves, others show the desktop clearly through the tint.
+        window._backdrop_blurred = False
+        if platforms.compositing():
+            window.setProperty('backdropMode', 'Transparent glass — your desktop decides whether to blur what is behind')
+            return True
+        window.setProperty('backdropMode', 'Opaque fallback — this desktop has no compositor for transparency')
+        return False
     if os.name != 'nt':
-        window.setProperty('backdropMode', 'Opaque fallback — native glass requires Windows')
+        window.setProperty('backdropMode', 'Opaque fallback — native glass requires Windows or Linux')
         return False
     blocker = _transparency_blocker()
     enabled, status = configure_backdrop(int(handle.winId()), normalize_theme(value) == 'glass',
@@ -423,13 +462,18 @@ def apply_theme(window, value, extra_qss=""):
     from .external_theme import palette_style, apply_inline_palettes
     from PySide6.QtCore import QTimer
     window.setStyleSheet(palette_style(theme_style(value) + extra_qss + CHROME_STYLE +
-                        '\nQMainWindow, QWidget#shell { background: ' + surface + '; }'))
+                        '\nQMainWindow, QWidget#shell { background: ' + surface + '; }' +
+                        (LINUX_STYLE if platforms.LINUX else '')))
     apply_inline_palettes(window)
+    if platforms.LINUX:
+        style_popup_frames(window)
     # Constructors call apply_theme before adding their children.
     def finish():
         import shiboken6
         if shiboken6.isValid(window):
             apply_inline_palettes(window)
+            if platforms.LINUX:
+                style_popup_frames(window)
     QTimer.singleShot(0, finish)
     if hasattr(window, 'schedule_backdrop'):
         window.schedule_backdrop()

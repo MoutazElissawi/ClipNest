@@ -229,7 +229,8 @@ class DesktopWindow(QMainWindow):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         area = QRectF(self.rect()).adjusted(.5, .5, -.5, -.5)
         if self._theme == 'glass' and self._backdrop:
-            alpha = round(255*self._glass_tint/100)
+            from .theme import glass_alpha
+            alpha = glass_alpha(self._glass_tint, getattr(self, '_backdrop_blurred', True))
             tint = QLinearGradient(0, 0, self.size().width(), self.size().height())
             tint.setColorAt(0, QColor(29, 38, 35, max(30, alpha-16)))
             tint.setColorAt(.48, QColor(14, 23, 20, alpha))
