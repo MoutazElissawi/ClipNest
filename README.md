@@ -5,7 +5,7 @@ Instant replay and screen recording, using your distribution's OBS Studio as the
 ## Requirements
 
 - 64-bit x86 Linux with Python 3.10 or newer (and `python3-venv` on Debian/Ubuntu)
-- **OBS Studio 30 or newer from your distribution's packages**. A Flatpak or Snap OBS keeps its libraries in a sandbox where ClipNest cannot load them. It can stay installed next to the distribution package.
+- **OBS Studio 30 or newer, including 33, from your distribution's packages**. A Flatpak or Snap OBS keeps its libraries in a sandbox where ClipNest cannot load them. It can stay installed next to the distribution package.
   - Debian/Ubuntu/Mint: `sudo apt install obs-studio python3-venv`
   - Fedora: `sudo dnf install obs-studio`
   - Arch: `sudo pacman -S obs-studio`
@@ -17,8 +17,8 @@ Instant replay and screen recording, using your distribution's OBS Studio as the
 ## Install
 
 ```sh
-tar xzf ClipNest-2.1.2-linux-x64.tar.gz
-cd ClipNest-2.1.2-linux-x64
+tar xzf ClipNest-2.1.3-linux-x64.tar.gz
+cd ClipNest-2.1.3-linux-x64
 ./install.sh
 ```
 
@@ -69,5 +69,5 @@ Run it again to update. `./uninstall.sh` removes the app and keeps your settings
   ```
 
   It shows where ClipNest looked for OBS, the OBS version, the plugins it needs and, on Wayland, whether the screen-sharing portal is there.
-- **"OBS Studio … was not found"**: install the distribution package above. ClipNest looks next to the `obs` command, in the system library cache, and in `/usr`, `/usr/local` and `/opt/obs-studio`. If OBS is somewhere else, start ClipNest with `CLIPNEST_OBS_PREFIX=/that/prefix`.
+- **"OBS Studio … was not found"**: install the distribution package above. ClipNest looks next to the `obs` command, in the system library cache, and in `/usr`, `/usr/local` and `/opt/obs-studio`. In each place it looks for OBS's plugin folder: `obs-modules/core` for OBS 33 and newer, `obs-plugins` for OBS 30 to 32. If OBS is somewhere else, start ClipNest with `CLIPNEST_OBS_PREFIX=/that/prefix`.
 - Logs are in `~/.local/share/ClipNest/clipnest.log` and `native-engine.log`.

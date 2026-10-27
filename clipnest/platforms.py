@@ -1,13 +1,14 @@
 """Which OS ClipNest runs on, and the Linux stand-ins for its Windows OBS pieces.
 
 Windows ClipNest downloads a pinned OBS runtime. Linux ClipNest uses the
-distribution's OBS Studio 30+ (libobs.so.0 and its plugins), loaded by the same
+distribution's OBS Studio 30+ (libobs and its plugins), loaded by the same
 private host process. IDs below are from OBS 32 source:
 plugins/linux-capture, linux-pipewire, linux-pulseaudio and obs-ffmpeg.
 """
 import ctypes.util
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -30,8 +31,13 @@ ENCODER_FALLBACKS = {"obs_nvenc_h264_tex": ("jim_nvenc", "ffmpeg_nvenc"),
 LINUX_TARGETS = ("display",)
 LINUX_AUDIO = {"wasapi_output_capture": "pulse_output_capture", "wasapi_input_capture": "pulse_input_capture"}
 LINUX_MODULES = ("linux-capture", "linux-pipewire", "linux-pulseaudio", "obs-ffmpeg", "obs-x264", "obs-nvenc")
-# OBS installs libobs.so.0 and obs-plugins/ in one library folder of its prefix, and its data in share/obs.
+# OBS installs libobs and its plugin folder in one library folder of its prefix, and its data in share/obs.
 LIB_SUBDIRS = ("lib/x86_64-linux-gnu", "lib64", "lib")
+# OBS 33 moved its own plugins and their data from obs-plugins to obs-modules/core; newest first,
+# because obs-plugins can stay behind holding only third-party plugins.
+PLUGIN_FOLDERS = ("obs-modules/core", "obs-plugins")
+# Debian and Ubuntu version the OpenGL module .so.1; upstream OBS and Arch use .so.30.
+OPENGL_FILES = ("libobs-opengl.so.1", "libobs-opengl.so.30")
 OBS_PREFIXES = ("/usr", "/usr/local", "/opt/obs-studio")
 FLATPAK_OBS = ("/var/lib/flatpak/app/com.obsproject.Studio", "~/.local/share/flatpak/app/com.obsproject.Studio")
 SNAP_OBS = "/snap/obs-studio"
@@ -89,19 +95,22 @@ def module_optional(name, env=None):
 
 
 def ld_cache_libobs():
-    """Paths of libobs.so.0 in the dynamic linker cache ('ldconfig -p'; /sbin is often off a user's PATH)."""
+    """Paths of libobs in the dynamic linker cache ('ldconfig -p'; /sbin is often off a user's PATH).
+
+    Debian names it libobs.so.0; upstream OBS and Arch register it as libobs.so.30.
+    """
     for ldconfig in ("ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"):
         try:
             listing = subprocess.run([ldconfig, "-p"], capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
             continue
         return [line.split("=>", 1)[1].strip() for line in listing.splitlines()
-                if line.strip().startswith("libobs.so.0 ") and "=>" in line]
+                if re.match(r"libobs\.so\.\d+ ", line.strip()) and "=>" in line]
     return []
 
 
 def prefix_of(path, kind):
-    """The install prefix above a 'bin/obs' command or a 'lib*/libobs.so.0' library."""
+    """The install prefix above a 'bin/obs' command or a 'lib*/libobs.so.N' library."""
     parent = Path(path).parent
     if kind == "command":
         return parent.parent if parent.name == "bin" else None
@@ -137,18 +146,20 @@ def obs_candidates(env, which=shutil.which, ld_cache=ld_cache_libobs, realpath=o
 def layout_at(prefix, exists=os.path.exists):
     """OBS's library, plugins and data under one prefix: (layout, '') or (None, why not)."""
     data = prefix / "share/obs"
-    for sub in LIB_SUBDIRS:
-        lib_dir = prefix / sub
-        if not exists(str(lib_dir / "obs-plugins")):
-            continue
-        if not exists(str(data / "libobs")):
-            return None, f"{lib_dir / 'obs-plugins'} exists, but its data folder {data / 'libobs'} is missing."
-        library, graphics = lib_dir / "libobs.so.0", lib_dir / "libobs-opengl.so.1"
-        # Load the libobs that belongs to these plugins. libobs appends ".so" to a bare graphics
-        # module name, and distributions ship only versioned files, so the fallbacks are sonames.
-        return {"library": str(library) if exists(str(library)) else ctypes.util.find_library("obs") or "libobs.so.0",
-                "graphics": str(graphics) if exists(str(graphics)) else ctypes.util.find_library("obs-opengl") or "libobs-opengl.so.1",
-                "plugins": lib_dir / "obs-plugins", "data": data}, ""
+    for folder in PLUGIN_FOLDERS:
+        for sub in LIB_SUBDIRS:
+            lib_dir = prefix / sub
+            if not exists(str(lib_dir / folder)):
+                continue
+            if not exists(str(data / "libobs")):
+                return None, f"{lib_dir / folder} exists, but its data folder {data / 'libobs'} is missing."
+            library = lib_dir / "libobs.so.0"
+            graphics = next((lib_dir / name for name in OPENGL_FILES if exists(str(lib_dir / name))), None)
+            # Load the libobs that belongs to these plugins. libobs appends ".so" to a bare graphics
+            # module name, and distributions ship only versioned files, so the fallbacks are sonames.
+            return {"library": str(library) if exists(str(library)) else ctypes.util.find_library("obs") or "libobs.so.0",
+                    "graphics": str(graphics) if graphics else ctypes.util.find_library("obs-opengl") or "libobs-opengl.so.1",
+                    "plugins": lib_dir / folder, "plugin_data": data / folder, "data": data}, ""
     return None, ""
 
 
@@ -171,14 +182,22 @@ def obs_layout(env=None, exists=os.path.exists, which=shutil.which, ld_cache=ld_
             return layout
         if problem:
             problems.append(problem)
+    elsewhere = " If OBS is installed in another folder, start ClipNest with CLIPNEST_OBS_PREFIX set to it."
+    found = " ".join(problems) + (" " if problems else "")
+    native = next((prefix for prefix, origin in candidates if origin.startswith("the obs command")), None)
+    if native is not None:
+        # OBS is installed here, so a sandboxed copy or the install commands are not the answer.
+        folders = " or ".join(PLUGIN_FOLDERS)
+        lib_dirs = ", ".join(str(native / sub) for sub in LIB_SUBDIRS)
+        raise RuntimeError(f"Found OBS Studio's obs command in {native / 'bin'}, but no {folders} plugin folder "
+                           f"in {lib_dirs}. " + found + elsewhere.strip() + " " + CHECK_HINT)
     sandbox = sandboxed_obs(env, exists)
     if sandbox:
         message = (f"OBS Studio is installed as a {sandbox}, and ClipNest cannot load OBS from inside that sandbox. "
                    "Also install your distribution's OBS Studio package; both can stay installed. ")
     else:
         message = "OBS Studio 30 or newer was not found in " + ", ".join(str(prefix) for prefix, _ in candidates) + ". "
-    elsewhere = " If OBS is installed in another folder, start ClipNest with CLIPNEST_OBS_PREFIX set to it."
-    raise RuntimeError(message + " ".join(problems) + (" " if problems else "") + INSTALL_HINT + elsewhere + " " + CHECK_HINT)
+    raise RuntimeError(message + found + INSTALL_HINT + elsewhere + " " + CHECK_HINT)
 
 
 def version_supported(version):

@@ -99,7 +99,7 @@ class NativeEngine:
         for name in modules:
             module = P()
             if layout:
-                binary, data_dir = layout["plugins"] / (name + ".so"), layout["data"] / "obs-plugins" / name
+                binary, data_dir = layout["plugins"] / (name + ".so"), layout["plugin_data"] / name
             else:
                 binary, data_dir = ENGINE / "obs-plugins/64bit" / (name + ".dll"), ENGINE / "data/obs-plugins" / name
             result = l.obs_open_module(C.byref(module), obs_path(binary), obs_path(data_dir))
