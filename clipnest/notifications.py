@@ -1,7 +1,7 @@
 """Silent, non-activating desktop overlay; no Windows balloon or audio API."""
 from collections import deque
 import ctypes
-from ctypes import wintypes
+from .winapi import wintypes
 import logging
 import os
 import time

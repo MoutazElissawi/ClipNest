@@ -1,6 +1,8 @@
 import ctypes
-from ctypes import wintypes
+import logging
+from .winapi import wintypes
 import os
+from . import platforms
 
 MODIFIERS = {"ALT": 1, "CTRL": 2, "SHIFT": 4, "WIN": 8}
 KEYS = {**{f"F{i}": 0x6F + i for i in range(1, 25)}, "SPACE": 0x20,
@@ -25,7 +27,26 @@ def parse_hotkey(text):
     return mods, vk
 
 
+_x11 = None
+
+
+def x11():
+    """ClipNest's X11 shortcut connection, or None without an X server (pure Wayland)."""
+    global _x11
+    if _x11 is None and platforms.LINUX and os.environ.get("DISPLAY"):
+        try:
+            from .x11_hotkeys import X11Hotkeys
+            _x11 = X11Hotkeys()
+        except (OSError, RuntimeError) as exc:
+            logging.getLogger("clipnest").warning("X11 shortcuts unavailable: %s", exc)
+            _x11 = False
+    return _x11 or None
+
+
 def held(text):
+    if platforms.LINUX:
+        backend = x11()
+        return bool(backend) and backend.held(parse_hotkey(text))
     if os.name != "nt":
         return False
     mods, vk = parse_hotkey(text)
@@ -41,7 +62,7 @@ def held(text):
 
 
 class Hotkeys:
-    """Thread-bound Win32 hotkeys, polled from the GUI's Qt timer."""
+    """Thread-bound Win32 hotkeys, or X11 key grabs on Linux, polled from the GUI's Qt timer."""
     def __init__(self):
         self.registered = []
 
@@ -50,6 +71,12 @@ class Hotkeys:
         if combinations[0] == combinations[1]:
             raise ValueError("Replay and record shortcuts must be different.")
         self.close()
+        if platforms.LINUX:
+            backend = x11()
+            if backend:
+                backend.configure(list(zip(combinations, ("save_replay", "toggle_record"))))
+                self.registered.append("x11")
+            return
         if os.name != "nt":
             return
         user = ctypes.windll.user32
@@ -60,6 +87,8 @@ class Hotkeys:
             self.registered.append(ident)
 
     def poll(self):
+        if platforms.LINUX:
+            return x11().poll() if self.registered else []
         if os.name != "nt":
             return []
         msg = wintypes.MSG()
@@ -69,7 +98,9 @@ class Hotkeys:
         return result
 
     def close(self):
-        if os.name == "nt":
+        if platforms.LINUX and self.registered:
+            x11().close()
+        elif os.name == "nt":
             for ident in self.registered:
                 ctypes.windll.user32.UnregisterHotKey(None, ident)
         self.registered.clear()

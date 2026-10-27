@@ -74,6 +74,11 @@ SIGNATURES = {
     "obs_volmeter_add_callback": (None, P, METER, P),
     "obs_volmeter_remove_callback": (None, P, METER, P),
 }
+# libobs/obs-nix-platform.h, plus reading the PipeWire portal's restore token back.
+LINUX_SIGNATURES = {
+    "obs_set_nix_platform": (None, I), "obs_set_nix_platform_display": (None, P),
+    "obs_source_save": (None, P), "obs_source_get_settings": (P, P), "obs_data_get_json": (S, P),
+}
 
 def utf8(value): return str(value).encode("utf-8")
 def obs_path(value): return str(value).replace("\\", "/").encode("utf-8")
@@ -81,22 +86,41 @@ def decode(value): return value.decode("utf-8", errors="replace") if value else 
 
 class LibObs:
     def __init__(self, root):
-        if os.name != "nt" or C.sizeof(P) != 8:
-            raise RuntimeError("The native engine requires 64-bit Python on Windows x64.")
-        root = Path(root).resolve()
-        bins = [root / "bin/64bit", root / "obs-plugins/64bit"]
-        self.dll_dirs = [os.add_dll_directory(str(p)) for p in bins]
-        os.environ["PATH"] = os.pathsep.join(map(str, bins)) + os.pathsep + os.environ.get("PATH", "")
-        os.chdir(bins[0])
-        self.dll = C.CDLL(str(bins[0] / "obs.dll"))
-        for name, spec in SIGNATURES.items():
+        from . import platforms
+        if C.sizeof(P) != 8 or not (platforms.WINDOWS or platforms.LINUX):
+            raise RuntimeError("The native engine requires 64-bit Python on Windows or Linux.")
+        if platforms.LINUX:
+            # root is platforms.obs_layout(): the distribution's OBS Studio.
+            self.dll = C.CDLL(root["library"])
+            signatures = {**SIGNATURES, **LINUX_SIGNATURES}
+        else:
+            root = Path(root).resolve()
+            bins = [root / "bin/64bit", root / "obs-plugins/64bit"]
+            self.dll_dirs = [os.add_dll_directory(str(p)) for p in bins]
+            os.environ["PATH"] = os.pathsep.join(map(str, bins)) + os.pathsep + os.environ.get("PATH", "")
+            os.chdir(bins[0])
+            self.dll = C.CDLL(str(bins[0] / "obs.dll"))
+            signatures = SIGNATURES
+        for name, spec in signatures.items():
             try: fn = getattr(self.dll, name)
             except AttributeError as exc: raise RuntimeError(f"Missing libobs export: {name}") from exc
             fn.restype, fn.argtypes = spec[0], list(spec[1:])
             setattr(self, name, fn)
         version = decode(self.obs_get_version_string())
-        if not version.startswith("32.2.2"):
+        if platforms.LINUX:
+            if not platforms.version_supported(version):
+                raise RuntimeError(f"ClipNest needs OBS Studio {platforms.MIN_OBS_MAJOR} or newer, found {version}. " + platforms.INSTALL_HINT)
+        elif not version.startswith("32.2.2"):
             raise RuntimeError(f"Expected OBS libraries 32.2.2, found {version}. Repair the runtime.")
+
+    def source_settings(self, source):
+        """A source's settings after its save callback (Linux only: the portal's RestoreToken)."""
+        self.obs_source_save(source)
+        data = self.obs_source_get_settings(source)
+        try:
+            return json.loads(decode(self.obs_data_get_json(data)) or "{}")
+        finally:
+            self.obs_data_release(data)
 
     @contextmanager
     def data(self, value):

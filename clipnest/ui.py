@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from ctypes import wintypes
+from .winapi import wintypes
 import math
 import logging
 import os
@@ -25,6 +25,7 @@ from .notifications import Notifications
 from .desktop import show_centered
 from .window_frame import DesktopWindow
 from .system_events import SystemEvents
+from . import platforms
 
 
 from .branding import app_icon as icon
@@ -192,6 +193,10 @@ class Window(DesktopWindow):
             self.engine.shutdown_done.connect(self.shutdown_complete)
             self.engine.start()
             self.register_hotkeys()
+            self.command_server = None
+            if platforms.LINUX:
+                from .commands import CommandServer
+                self.command_server = CommandServer(self, self.submit)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(40)
@@ -401,6 +406,10 @@ class Window(DesktopWindow):
         self.capture_target.addItem("All displays · stitched into one video", "displays")
         self.capture_target.addItem("Individual window", "window")
         self.capture_target.addItem("Game capture · osu! / fullscreen games", "game")
+        if platforms.LINUX:
+            # Games only and window capture need Windows game hooks.
+            for value in ("games", "displays", "window", "game"):
+                self.capture_target.removeItem(self.capture_target.findData(value))
         self.capture_target.setCurrentIndex(max(0, self.capture_target.findData(self.settings.get("capture_target", "display"))))
         form.addRow("Capture", self.capture_target)
         self.monitor = QComboBox()
@@ -495,6 +504,8 @@ class Window(DesktopWindow):
         self.app_audio.setToolTip('Records one application, such as Spotify or Discord, on an extra track you can mute or adjust in the editor. '
                                   'It still plays in the Desktop and Mix tracks. Stop capture and use Apply settings to change it.')
         form.addRow('Application track', self.app_audio)
+        if platforms.LINUX:
+            form.setRowVisible(self.app_audio, False)  # Per-app audio needs Windows process capture.
         form.addRow(self.button('Refresh devices', lambda: self.submit('refresh_devices')))
         form.addRow(self.button('Apply / reconnect audio', self.apply_audio, 'quiet'))
         audio_note = QLabel('Audio changes apply while capturing. System default follows Windows; a named device stays pinned. Playback follows the Windows output. Switching can leave a brief audio gap.')
@@ -763,6 +774,10 @@ class Window(DesktopWindow):
     def tick(self):
         if self.preview or self.closing:
             return
+        if platforms.LINUX:
+            # X11 grabs are polled here; Windows delivers WM_HOTKEY through NativeHotkeys.
+            for command in self.hotkeys.poll():
+                self.submit(command)
         mode, volume = self.mode.currentText(), self.volume.value()
         try:
             pressed = held(self.settings["ptt_key"]) if mode == "Push to talk" and not self.capturing_shortcut else False
@@ -815,6 +830,8 @@ class Window(DesktopWindow):
             self.record_btn.style().polish(self.record_btn)
         recording = f"Recording {data['timecode']}" if self.recording else "Manual recording off"
         capture = {0: "Automatic capture", 1: "DXGI capture", 2: "Windows Graphics Capture"}.get(data.get("capture_method"), "Screen capture") if data.get("capture_attached") else "Screen capture idle"
+        if platforms.LINUX and data.get("capture_attached"):
+            capture = "PipeWire screen share" if platforms.wayland() else "X11 screen capture"
         if data.get("game_layer") and data.get("capture_attached"):
             capture += " + game hook"
         if data.get("capture_target", "display") in ("window", "game"):
@@ -842,6 +859,11 @@ class Window(DesktopWindow):
         self.window_method.setEnabled(self.capture_target.currentData() == "window")
         self.window_options.setVisible(window)
         self.window_options_form.setRowVisible(self.window_method, self.capture_target.currentData() == "window")
+        if platforms.LINUX:
+            for control in (self.capture_method, self.game_layer, self.game_audio_only):
+                control.parentWidget().layout().setRowVisible(control, False)
+            # The Wayland portal picks the display in its own dialog.
+            self.monitor.parentWidget().layout().setRowVisible(self.monitor, not platforms.wayland())
 
     def update_devices(self, data):
         self.device_data = data
@@ -1079,6 +1101,8 @@ class Window(DesktopWindow):
             if self.quick_player is not None:
                 self.quick_player.close()
             self.hotkeys.close()
+            if getattr(self, 'command_server', None) is not None:
+                self.command_server.close()
             if self.system_events is not None:
                 self.system_events.close()
             QApplication.instance().removeNativeEventFilter(self.native_filter)

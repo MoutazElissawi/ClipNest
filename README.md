@@ -1,40 +1,61 @@
-# ClipNest
+# ClipNest for Linux
 
-Windows screen recorder with instant replay, automatic game folders, a clip gallery and a lightweight editor.
-
-## How to launch
-
-**Installer (recommended)**
-1. Download `ClipNest-Setup-<version>-x64.exe` from the [Releases](../../releases) page and run it. No administrator rights are needed.
-2. Open **ClipNest** from the Start menu. The first launch downloads its recording engine, so it needs internet.
-3. To use instant replay, editing and thumbnails, install [FFmpeg](https://ffmpeg.org/download.html). In ClipNest's editor, choose **File → FFmpeg folder** and select the folder that contains `ffmpeg.exe` and `ffprobe.exe` (usually `bin`).
-
-**From source**
-1. Install 64-bit [Python 3.11–3.13](https://www.python.org/downloads/windows/) with the Python launcher.
-2. Download this repository and double-click `Start_ClipNest.bat`. The first run installs what it needs; later runs start ClipNest directly.
-
-**If ClipNest won't open** after you turn on frosted glass, run `Launch_Classic_Mode.bat` (it's also in the installation folder at `%LOCALAPPDATA%\Programs\ClipNest`).
+Instant replay and screen recording, using your distribution's OBS Studio as the recording engine.
 
 ## Requirements
-- Windows 10 version 2004 or newer, or Windows 11 (64-bit).
-- FFmpeg and ffprobe (not included).
-- An NVIDIA or AMD GPU for hardware encoding; CPU encoding always works.
 
-## Features
-- Instant replay with a hotkey, plus manual recording at the same time.
-- Games only (the default): records just the game you are playing, never the desktop or other apps. Alt-Tab keeps the game in the clip, a minimized game records black, and the replay never restarts. Games that hide from screen capture, such as VALORANT, are recorded too.
-- Or record one display, all displays stitched into one video, or a single window.
-- Separate Mix, Desktop and Microphone audio tracks, plus an optional track for one app (e.g. Spotify). Optionally record only the game's audio. Push-to-talk and mic controls.
-- Clips are sorted into folders by game automatically.
-- Gallery with search, favorites, tags, a game filter and quick playback.
-- Editor: trim, crop, colors, per-track volume and muting, export to MKV, MP4, MP3, M4A, WAV or FLAC, or Copy (no re-encode) for instant lossless trims.
-- Black-and-green theme, optional frosted glass, and custom color themes (Settings → Appearance → Save theme template, edit the JSON, then Load theme).
+- 64-bit x86 Linux with Python 3.10 or newer (and `python3-venv` on Debian/Ubuntu)
+- **OBS Studio 30 or newer from your distribution's packages**. The Flatpak keeps its libraries in a sandbox where ClipNest cannot load them.
+  - Debian/Ubuntu: `sudo apt install obs-studio python3-venv`
+  - Fedora: `sudo dnf install obs-studio`
+  - Arch: `sudo pacman -S obs-studio`
+- Optional: `ffmpeg`, for the clip editor's exports. Recording does not need it.
 
-## Updating and your files
-Quit ClipNest (including the tray icon) and run the newer installer. Settings live in `%LOCALAPPDATA%\ClipNest`; recordings stay in the folder you chose. Uninstalling keeps both.
+## Install
 
-## Building the installer
-Run `packaging\Build_Installer.bat` (needs Python 3.11–3.13 and Inno Setup 6.3+). Details: [packaging/BUILD.md](packaging/BUILD.md).
+```sh
+tar xzf ClipNest-2.1.1-linux-x64.tar.gz
+cd ClipNest-2.1.1-linux-x64
+./install.sh
+```
 
-## License
-GPL-2.0-or-later. See [LICENSE.txt](LICENSE.txt) and [THIRD_PARTY.md](THIRD_PARTY.md). ClipNest uses the OBS recording engine (libobs) and is not affiliated with OBS, NVIDIA, AMD or Riot Games.
+The installer needs no root and writes only to your home folder:
+
+- the app goes in `~/.local/share/clipnest-app`
+- the command is `~/.local/bin/clipnest`
+- it adds an entry to your applications menu
+
+Run it again to update. `./uninstall.sh` removes the app and keeps your settings and clips.
+
+## What works on Linux
+
+- **Entire display** capture:
+  - X11 captures the screen you choose in Settings.
+  - Wayland asks once through the system's screen-share dialog, and ClipNest remembers your choice for later sessions.
+- System audio and microphone (PipeWire or PulseAudio), each on its own track as on Windows.
+- Encoders:
+  - NVIDIA (NVENC)
+  - AMD/Intel (VAAPI)
+  - CPU x264, the default. Pick a hardware encoder in Settings → Encoder if your OBS supports it.
+- Instant replay, recording, the clip library and the editor.
+
+**Shortcuts.** On X11, global shortcuts and push-to-talk work as on Windows. Wayland does not let apps grab keys everywhere:
+
+- ClipNest's shortcuts work while an XWayland window is focused, which covers most Steam/Proton games.
+- To save from any app, add a system keyboard shortcut in your desktop's settings that runs:
+
+  ```sh
+  ~/.local/bin/clipnest --save-replay
+  ```
+
+  `clipnest --toggle-record` starts or stops recording the same way. Both also appear when you right-click ClipNest in the applications menu.
+
+## Not available on Linux yet
+
+- **Games only**, window capture and game capture: these use Windows game hooks. On Linux, record the display.
+- Game-only audio and the per-application audio track.
+
+## Troubleshooting
+
+- **"OBS Studio was not found"**: install the distribution package above. If OBS is installed under a custom prefix, start ClipNest with `CLIPNEST_OBS_PREFIX=/that/prefix`.
+- Logs are in `~/.local/share/ClipNest/clipnest.log` and `native-engine.log`.

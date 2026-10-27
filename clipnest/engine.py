@@ -11,7 +11,7 @@ from PySide6.QtCore import QThread, Signal
 
 from .catalog import Catalog, archive_file, foreground
 from .config import DATA, ENGINE, SETTINGS, atomic_json, validate
-from . import fullscreen
+from . import fullscreen, platforms
 from .native_client import NativeClient, NativeError as ObsError
 
 log = logging.getLogger("clipnest")
@@ -399,8 +399,11 @@ class Engine(QThread):
         self.retiring_clients = [c for c in self.retiring_clients if c.process.poll() is None]
         if self.retiring_clients:
             raise RuntimeError("The previous native engine is still finishing. Wait before starting another session.")
-        if not (ENGINE / "bin/64bit/obs.dll").exists():
+        if platforms.LINUX:
+            platforms.obs_layout()  # Raises with install instructions when OBS Studio is missing.
+        elif not (ENGINE / "bin/64bit/obs.dll").exists():
             raise RuntimeError("Recorder libraries are missing. Close ClipNest and run Start_ClipNest.bat.")
+        self.screen_permission_saved = False
         self.message.emit("Starting ClipNest's native recording engine...")
         self.stitch = self.stitch_layout()
         self.rpc = NativeClient(self.host_settings(), self.on_event)
@@ -440,6 +443,8 @@ class Engine(QThread):
         video_settings = ({"window": self.settings.get("window_value", ""), "method": self.settings.get("window_method", 2),
                            "priority": 2, "cursor": True, "client_area": True, "capture_audio": False, "force_sdr": True}
                           if window_capture else {"capture_cursor": True, "method": self.settings.get("capture_method", 2)})
+        if platforms.LINUX:
+            video_settings = platforms.screen_settings(self.settings)
         if self.settings.get("capture_target") == "game":
             video_settings = {"capture_mode": "window", "window": self.settings.get("window_value", ""),
                               "priority": 2, "capture_cursor": True, "anti_cheat_hook": True, "capture_audio": False}
@@ -449,15 +454,15 @@ class Engine(QThread):
                                        (DESKTOP, "wasapi_output_capture", {"device_id": self.settings["desktop_device"], "use_device_timing": False}),
                                        (MIC, "wasapi_input_capture", {"device_id": self.settings["mic_device"], "use_device_timing": False})]:
             if name not in inputs:
-                kind = input_kind(kinds, prefix)
+                kind = input_kind(kinds, platforms.source_kind(prefix))
                 if not kind:
-                    raise RuntimeError(f"The native engine is missing its Windows capture component: {prefix}")
+                    raise RuntimeError(f"The native engine is missing its capture component: {platforms.source_kind(prefix)}")
                 self.call("CreateInput", sceneName=SCENE, inputName=name, inputKind=kind,
                           inputSettings=settings, sceneItemEnabled=True)
             elif name != SCREEN:
                 self.call("SetInputSettings", inputName=name, inputSettings=settings)
-        if not window_capture:
-            monitor_property = self.settings["monitor_property"]
+        if not window_capture and (not platforms.LINUX or platforms.monitor_property()):
+            monitor_property = platforms.monitor_property() or self.settings["monitor_property"]
             monitors = self.call("GetInputPropertiesListPropertyItems", inputName=SCREEN,
                                  propertyName=monitor_property)["propertyItems"]
             monitors = [m for m in monitors if m.get("itemEnabled", True)]
@@ -609,6 +614,15 @@ class Engine(QThread):
         def capture_kind(prefix):
             return input_kind(kinds, prefix, prefix)
         result["monitors"] = []
+        if platforms.LINUX:
+            # xshm lists X11 screens; on Wayland the portal dialog picks the display.
+            prop = platforms.monitor_property()
+            if prop:
+                result["monitors"] = self.call("GetInputPropertiesListPropertyItems", inputName=SCREEN, propertyName=prop)["propertyItems"]
+                result["monitor_property"] = prop
+            result["windows"], result["audio_apps"] = [], []
+            self.devices.emit(result)
+            return
         for prop in ("monitor_id", "monitor"):
             try:
                 items = self.call("GetInputPropertiesListPropertyItems", inputKind=capture_kind("monitor_capture"), propertyName=prop)["propertyItems"]
@@ -636,6 +650,19 @@ class Engine(QThread):
         if self.muted != muted:
             self.call("SetInputMute", inputName=MIC, inputMuted=bool(muted))
             self.muted = muted
+
+    def remember_screen_permission(self):
+        """Keep the Wayland portal's restore token so the share dialog is not shown every session.
+
+        The portal issues a new single-use token each time OBS starts a screencast.
+        """
+        if not (platforms.LINUX and platforms.wayland()) or getattr(self, "screen_permission_saved", True):
+            return
+        token = self.call("GetInputSettings", inputName=SCREEN)["inputSettings"].get("RestoreToken") or ""
+        if token and token != self.settings.get("pipewire_restore_token"):
+            self.settings["pipewire_restore_token"] = token
+            atomic_json(SETTINGS, self.settings)
+            self.screen_permission_saved = True
 
     def poll(self):
         rec = self.call("GetRecordStatus")
@@ -672,6 +699,7 @@ class Engine(QThread):
                 return
         else:
             self.capture_missing_since = None
+        self.remember_screen_permission()
         elapsed = time.monotonic() - self.replay_started if self.replay_started else None
         self.state.emit({"connected": True, "recording": self.recording, "replay": self.replay,
                          "timecode": rec["outputTimecode"], "app": self.capture_app(),

@@ -13,6 +13,7 @@ import time
 import traceback
 from .config import DATA, ENGINE, ENCODERS, validate
 from .libobs import LibObs, VideoInfo, AudioInfo, Vec2, SIGNAL, METER, P, utf8, obs_path, decode
+from . import platforms
 
 
 OBS_ORDER_MOVE_BOTTOM = 3  # enum obs_order_movement
@@ -61,31 +62,52 @@ class NativeEngine:
         self.staging.mkdir(parents=True, exist_ok=True)
         config_dir = DATA / "native-config"
         config_dir.mkdir(parents=True, exist_ok=True)
-        self.lib = l = LibObs(ENGINE)
+        layout = platforms.obs_layout() if platforms.LINUX else None
+        self.lib = l = LibObs(layout or ENGINE)
         from . import __version__
         print(f"ClipNest {__version__} host: {sys.executable}; encoder: {settings['encoder']}", file=sys.stderr, flush=True)
+        if layout:
+            # libobs needs the windowing system before startup; linux-capture registers xshm only on X11.
+            nix = platforms.OBS_NIX_PLATFORM_WAYLAND if platforms.wayland() else platforms.OBS_NIX_PLATFORM_X11_EGL
+            l.obs_set_nix_platform(nix)
+            l.obs_set_nix_platform_display(P(platforms.open_display(nix)))
+            print(f"OBS {decode(l.obs_get_version_string())} from {layout['library']}; "
+                  f"{'Wayland' if nix == platforms.OBS_NIX_PLATFORM_WAYLAND else 'X11'} session", file=sys.stderr, flush=True)
         if not l.obs_startup(b"en-US", obs_path(config_dir), None):
             raise RuntimeError("libobs initialization failed. See native-engine.log.")
         self.started = True
         from .native_tasks import NativeTasks
         self.ui_tasks = NativeTasks()
         l.obs_set_ui_task_handler(self.ui_tasks.callback)
-        l.obs_add_data_path(obs_path(ENGINE / "data/libobs"))
-        graphics = obs_path(ENGINE / "bin/64bit/libobs-d3d11.dll")
+        if layout:
+            l.obs_add_data_path(obs_path(layout["data"] / "libobs"))
+            graphics = obs_path(layout["graphics"])
+        else:
+            l.obs_add_data_path(obs_path(ENGINE / "data/libobs"))
+            graphics = obs_path(ENGINE / "bin/64bit/libobs-d3d11.dll")
         # Stitched displays render on a full-size base canvas and encode a scaled output.
         video = VideoInfo(graphics, settings["fps"], 1, settings.get("base_width", settings["width"]),
                           settings.get("base_height", settings["height"]),
                           settings["width"], settings["height"], 2, 0, True, 2, 1, 2)
         result = l.obs_reset_video(C.byref(video))
         if result != 0:
-            raise RuntimeError(f"Direct3D initialization failed (libobs code {result}). Check graphics drivers and native-engine.log.")
+            api = "OpenGL" if layout else "Direct3D"
+            raise RuntimeError(f"{api} initialization failed (libobs code {result}). Check graphics drivers and native-engine.log.")
         if not l.obs_reset_audio(C.byref(AudioInfo(48000, 2))):
             raise RuntimeError("Could not initialize 48 kHz stereo audio.")
-        for name in ("win-capture", "win-wasapi", "obs-ffmpeg", "obs-x264", "obs-nvenc"):
+        modules = platforms.LINUX_MODULES if layout else ("win-capture", "win-wasapi", "obs-ffmpeg", "obs-x264", "obs-nvenc")
+        for name in modules:
             module = P()
-            result = l.obs_open_module(C.byref(module), obs_path(ENGINE / "obs-plugins/64bit" / (name + ".dll")),
-                                       obs_path(ENGINE / "data/obs-plugins" / name))
+            if layout:
+                binary, data_dir = layout["plugins"] / (name + ".so"), layout["data"] / "obs-plugins" / name
+            else:
+                binary, data_dir = ENGINE / "obs-plugins/64bit" / (name + ".dll"), ENGINE / "data/obs-plugins" / name
+            result = l.obs_open_module(C.byref(module), obs_path(binary), obs_path(data_dir))
             if result != 0 or not l.obs_init_module(module):
+                if layout and platforms.module_optional(name):
+                    # Distribution OBS builds differ; OBS 30 has NVENC inside obs-ffmpeg instead.
+                    print(f"Optional OBS module {name} unavailable (code {result})", file=sys.stderr, flush=True)
+                    continue
                 if name == "obs-nvenc":
                     self.emit("NativeWarning", {"message": "NVIDIA encoder initialization failed. See native-engine.log for the helper or driver error."})
                     continue
@@ -186,12 +208,14 @@ class NativeEngine:
         if self.encoders or self.outputs:
             raise RuntimeError("Output initialization was incomplete. Stop and reconnect the engine before retrying.")
         l, s = self.lib, self.settings
-        encoder_id = ENCODERS[s["encoder"]]
         available = l.enumerate(l.obs_enum_encoder_types)
-        if encoder_id not in available:
+        encoder_id = platforms.encoder_id(ENCODERS[s["encoder"]], available)
+        if not encoder_id:
             raise RuntimeError(f"{s['encoder']} is unavailable. Stop replay and select another encoder in Settings.")
         from .encoding import video_encoder_settings
         video_settings = video_encoder_settings(s)
+        if encoder_id.startswith("jim_"):
+            video_settings["preset2"] = video_settings.get("preset", "p4")  # OBS 30 NVENC's preset key
         print(f'Video encoder settings: {video_settings}; one shared video encoder for replay + recording', file=sys.stderr, flush=True)
         with l.data(video_settings) as data:
             video = l.obs_video_encoder_create(utf8(encoder_id), b"ClipNest Video", data, None)
@@ -361,8 +385,8 @@ class NativeEngine:
             for spec in sources:
                 name = spec['inputName']
                 old, kind = self.inputs[name]
-                if not kind.startswith('wasapi_'):
-                    raise ValueError('Only WASAPI sources can be reconnected as audio.')
+                if not platforms.audio_kind(kind):
+                    raise ValueError('Only system audio sources can be reconnected as audio.')
                 with l.data({'device_id': spec['device_id'], 'use_device_timing': False}) as data:
                     source = l.obs_source_create(utf8(kind), utf8(name+' reconnecting'), data, None)
                 if not source:
@@ -433,7 +457,7 @@ class NativeEngine:
             self.items[a["inputName"]] = item
             if a.get("sceneItemEnabled") is False:
                 l.obs_sceneitem_set_visible(item, False)
-            if a["inputKind"].startswith("wasapi"):
+            if platforms.audio_kind(a["inputKind"]):
                 l.obs_source_set_muted(source, True)
                 self.attach_meter(source, a["inputName"])
         elif method == "GetInputPropertiesListPropertyItems": return self.properties(a.get("inputName", a.get("inputKind")), a["propertyName"], kind=a.get("inputKind"))
@@ -450,6 +474,8 @@ class NativeEngine:
         elif method == "SetInputEnabled":
             # Disabled sources are not drawn but keep ticking, so a game hook stays attached.
             l.obs_source_set_enabled(self.inputs[a["inputName"]][0], bool(a["inputEnabled"]))
+        elif method == "GetInputSettings":
+            return {"inputSettings": l.source_settings(self.inputs[a["inputName"]][0])}
         elif method == "GetGameLayerState":
             source = self.inputs[a["inputName"]][0]
             return dict(l.game_hook(source), size=[l.obs_source_get_width(source), l.obs_source_get_height(source)])

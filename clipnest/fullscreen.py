@@ -8,7 +8,7 @@ while the hooked game is the focused fullscreen window on the captured monitor.
 """
 import ctypes
 import os
-from ctypes import wintypes
+from .winapi import wintypes
 
 SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
 WS_MAXIMIZE, WS_BORDER = 0x01000000, 0x00800000

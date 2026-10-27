@@ -5,11 +5,16 @@ import logging
 import os
 from pathlib import Path
 
-DATA = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".local/share"))) / "ClipNest"
+from . import platforms
+
+_LINUX_DATA = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+DATA = Path(os.environ.get("LOCALAPPDATA", _LINUX_DATA)) / "ClipNest"
 ENGINE = DATA / "engine"
 SETTINGS = DATA / "settings.json"
 ENCODERS = {"NVIDIA H.264": "obs_nvenc_h264_tex", "NVIDIA AV1": "obs_nvenc_av1_tex", "CPU H.264 (fallback)": "obs_x264"}
 ENCODERS.update({"AMD H.264": "h264_texture_amf", "AMD HEVC": "h265_texture_amf", "AMD AV1": "av1_texture_amf"})
+if platforms.LINUX:
+    ENCODERS = dict(platforms.LINUX_ENCODERS)
 
 
 def atomic_json(path: Path, value):
@@ -29,10 +34,13 @@ def load_settings():
                     mic_mode="Always on", mic_volume=100, ptt_key="F8",
                     replay_key="Ctrl+Shift+F10", record_key="Ctrl+Shift+F9",
                     games={}, ui_theme='dark', theme_file='', glass_tint=46, notifications_enabled=True, notification_corner='Top right',
-                    notification_seconds=3, notification_screen='')
+                    notification_seconds=3, notification_screen='', pipewire_restore_token='')
     pristine = dict(defaults)
-    if os.name != 'nt':
+    if not platforms.WINDOWS:
         pristine['encoder'] = defaults['encoder'] = 'CPU H.264 (fallback)'
+    if platforms.LINUX:
+        # Games only needs Windows game hooks; Linux records the display.
+        pristine['capture_target'] = defaults['capture_target'] = 'display'
     repaired = []
     if SETTINGS.exists():
         try:
@@ -125,6 +133,10 @@ def validate(s):
         raise ValueError("Choose a supported replay mode.")
     if s.get("capture_target", "display") not in ("games", "display", "displays", "window", "game"):
         raise ValueError("Choose Games only, Display or Window capture.")
+    if platforms.LINUX and s.get("capture_target", "display") not in platforms.LINUX_TARGETS:
+        raise ValueError("On Linux, ClipNest records the entire display. Games only and window capture need Windows.")
+    if not isinstance(s.get("pipewire_restore_token", ""), str):
+        raise ValueError("Invalid screen-share permission token.")
     if not isinstance(s.get("app_audio", ""), str) or (s.get("app_audio") and len(s["app_audio"].split(":")) != 3):
         raise ValueError("Choose a valid application for the extra audio track.")
     if type(s.get("export_sound", True)) is not bool:

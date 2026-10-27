@@ -1,6 +1,6 @@
 """Debounced Windows lifecycle and audio endpoint events (GUI thread only)."""
 import ctypes
-from ctypes import wintypes
+from .winapi import wintypes
 import os
 import logging
 import time

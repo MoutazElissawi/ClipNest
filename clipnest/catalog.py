@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ctypes
-from ctypes import wintypes
+from .winapi import wintypes
 from datetime import datetime
 import os
 from pathlib import Path

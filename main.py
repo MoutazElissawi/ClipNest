@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from clipnest.config import DATA, SETTINGS, load_settings, atomic_json
 from clipnest.ui import Window
 from clipnest.branding import app_icon, set_windows_app_id
-from clipnest import __version__
+from clipnest import __version__, platforms
 
 
 def main():
@@ -19,6 +19,7 @@ def main():
         from clipnest.install_support import hold_install_mutex
         hold_install_mutex()
     set_windows_app_id()
+    platforms.choose_qt_audio_backend()
     app = QApplication(sys.argv)
     app.setApplicationName("ClipNest")
     app.setWindowIcon(app_icon())
@@ -27,11 +28,20 @@ def main():
     handler = RotatingFileHandler(DATA / "clipnest.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
     logging.basicConfig(level=logging.INFO, handlers=[handler], format="%(asctime)s %(levelname)s %(message)s")
     lock = QLockFile(str(DATA / "app.lock"))
+    if platforms.LINUX:
+        from clipnest.commands import requested, send
+        command = requested(sys.argv)
+        if command:
+            # A desktop shortcut ran `clipnest --save-replay`: hand it to the running app.
+            if send(command):
+                return 0
+            print("ClipNest is not running.", file=sys.stderr)
+            return 1
     if not preview and not lock.tryLock(100):
         QMessageBox.information(None, "ClipNest", "ClipNest is already running. Check its tray icon.")
         return 0
-    if os.name != "nt" and not preview:
-        QMessageBox.warning(None, "Windows required", "Recording requires Windows 10/11 x64. Use --preview to inspect the interface here.")
+    if not (platforms.WINDOWS or platforms.LINUX) and not preview:
+        QMessageBox.warning(None, "Windows or Linux required", "Recording requires Windows 10/11 or Linux x64. Use --preview to inspect the interface here.")
         return 1
     try:
         if not preview and (Path(__file__).parent / "runtime/pythonw.exe").is_file():
