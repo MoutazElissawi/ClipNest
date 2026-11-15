@@ -5,8 +5,11 @@ import threading
 import tempfile
 from fractions import Fraction
 
+# Waveform jobs need numpy. It loads here, on the GUI thread, when the editor first opens: a first import
+# inside a waveform worker thread later crashed Qt's event loop (Windows access violation).
+import numpy  # noqa: F401
 from PySide6.QtCore import Qt, QThread, Signal, QUrl, QSize
-from PySide6.QtGui import QImage, QIcon
+from PySide6.QtGui import QImage, QIcon, QKeySequence, QShortcut
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
@@ -16,7 +19,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton, Q
 
 from .config import DATA, atomic_json
 from .media import (tools_path, probe, available_encoders, Edit, export_clip, ENCODERS, COPY, estimated_size, ExportETA, EncoderProbeCache,
-                    add_range, remove_range, keep_only_range)
+                    add_range, remove_range, keep_only_range, doubled_tracks)
 from .preview import VideoCanvas, Waveform
 from .editor_assets import waveform
 from .export_progress import ExportProgressBar
@@ -45,6 +48,7 @@ class Job(QThread):
 from .desktop import DefaultAudioOutput, show_centered, ItemDelegate, SeekSlider
 from .window_frame import DesktopWindow
 from .playback_lifecycle import PlaybackLifecycle
+from .frame_step import FrameStepper
 
 
 class Editor(DesktopWindow):
@@ -60,6 +64,7 @@ class Editor(DesktopWindow):
         self.setMinimumSize(1000, 600)
         self.clips_folder = Path(parent.settings["output"]) if parent is not None and hasattr(parent, "settings") else Path.home()/"Videos/ClipNest"
         self.encoder_errors = {}
+        self.encoder_refresh = None
         self.encoder_probe = EncoderProbeCache(lambda path: available_encoders(path))
         self.last_export_path = None
         self.info = None
@@ -144,6 +149,10 @@ class Editor(DesktopWindow):
         self.video_sink.videoFrameChanged.connect(self.video.frame_changed)
         self.player.setVideoSink(self.video_sink)
         self.playback_lifecycle = PlaybackLifecycle(self, self.player, self.video)
+        self.frame_stepper = FrameStepper(self.player, self.video_sink)
+        # Text and number fields keep the arrows for their own cursor.
+        QShortcut(QKeySequence('Left'), self, activated=lambda: self.step_frame(-1))
+        QShortcut(QKeySequence('Right'), self, activated=lambda: self.step_frame(1))
         self.video.clipDropped.connect(self.open_clip)
         layout.addWidget(self.video, 1)
         def icon_button(name, tooltip, callback, large=False):
@@ -255,16 +264,16 @@ class Editor(DesktopWindow):
         self.tracks.setColumnWidth(2, 80)
         self.tracks.verticalHeader().setDefaultSectionSize(46)
         self.tracks.verticalHeader().setVisible(False)
+        self.tracks.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)  # whole-row jumps felt ragged
         self.tracks.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         self.tracks.setItemDelegate(ItemDelegate(self.tracks))
         self.tracks.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.tracks.setMinimumHeight(205)
-        self.tracks.setMaximumHeight(210)
-        side.addWidget(self.tracks)
+        self.tracks.setMinimumHeight(150)  # the glass title bar costs 48 px; 205 pushed Export below an 800 px window
+        side.addWidget(self.tracks, 1)  # takes the panel's spare height, so more tracks show without scrolling
         self.remix = QCheckBox('Combine selected audio into one track')
         self.remix.toggled.connect(self.remix_changed)
         side.addWidget(self.remix)
-        note = QLabel('Listen solo selects the waveform track. Combining excludes the existing Mix to avoid doubling.\nLive colors are approximate; Preview export checks final filters and audio. Solo volume is capped at 100%; export supports 200%.')
+        note = QLabel('Listen solo selects the waveform track. Combining excludes the existing Mix (and Desktop when Game or app tracks exist) to avoid doubling.\nLive colors are approximate; Preview export checks final filters and audio. Solo volume is capped at 100%; export supports 200%.')
         note.setToolTip(note.text())
         note.setText('Listen solo previews a track and shows it on the waveform; Shift+drag there to mute or keep parts of it.')
         note.setWordWrap(True)
@@ -356,7 +365,6 @@ class Editor(DesktopWindow):
         self.status = QLabel('FFmpeg tools are required for inspection and export. File → FFmpeg folder to configure.')
         self.status.setWordWrap(True)
         footer.addWidget(self.status)
-        side.addStretch()
         root_layout.addLayout(footer)
         self.setCentralWidget(root)
         file_menu = self.menuBar().addMenu('File')
@@ -457,7 +465,10 @@ class Editor(DesktopWindow):
     def step_frame(self, direction):
         if not self.info:
             return
-        try:
+        self.selection_playing = False
+        if self.frame_stepper.step(direction):
+            return
+        try:  # no frame on screen yet: count from the player's clock
             fps = float(Fraction(self.info['video'].get('avg_frame_rate', '0/1')))
             if not 0 < fps <= 1000:
                 return
@@ -468,8 +479,10 @@ class Editor(DesktopWindow):
 
     def remix_changed(self, checked):
         if checked and len(self.track_rows) > 1:
+            # Mix holds the other tracks; with Game or app tracks, Desktop holds those too.
+            doubled = doubled_tracks(title for _, title, _, _, _ in self.track_rows)
             for _, title, check, _, _ in self.track_rows:
-                if title.strip().casefold() == 'mix':
+                if title.strip().casefold() in doubled:
                     check.setChecked(False)
 
     def start_waveform(self, row=0):
@@ -935,6 +948,27 @@ class Editor(DesktopWindow):
         self.status.setText('Testing encoders with two frames each…')
         self.launch(lambda job: self.encoder_probe.get(ffmpeg, force=True), self.encoders_checked)
 
+    def refresh_encoders(self):
+        """Re-test encoders after an old result was used; the opened clip never waits for this."""
+        if self.encoder_refresh is not None:
+            return
+        try:
+            ffmpeg, _ = tools_path(self.prefs.get('ffmpeg_folder', ''))
+        except ValueError:
+            return
+        job = Job(lambda job: self.encoder_probe.get(ffmpeg), self)
+        def ready(result):
+            shown = ([label for label in self.available_export_encoders if label != COPY], sorted(self.encoder_errors))
+            if not self.busy() and (list(result[0]), sorted(result[1])) != shown:
+                self.encoders_checked(result)
+        def finished():
+            self.encoder_refresh = None
+            job.deleteLater()
+        job.result.connect(ready)
+        job.finished.connect(finished)
+        self.encoder_refresh = job
+        job.start()
+
     def encoders_checked(self, result):
         labels, errors = result
         self.encoder_errors = errors
@@ -966,8 +1000,15 @@ class Editor(DesktopWindow):
             self.error(str(exc))
             return
         self.player.pause()
-        self.status.setText('Inspecting clip and checking encoders…')
-        self.launch(lambda job: (probe(path, ffprobe), self.encoder_probe.get(ffmpeg)), self.loaded)
+        def inspect(job):
+            info = probe(path, ffprobe)
+            # Testing every encoder takes over a second; only the first clip of a session waits for it.
+            cached = self.encoder_probe.cached(ffmpeg)
+            if cached is None:
+                return info, self.encoder_probe.get(ffmpeg)
+            return info, cached[0], not cached[1]
+        self.status.setText('Inspecting clip…')
+        self.launch(inspect, self.loaded)
 
     def loaded(self, result):
         self.last_export_path = None
@@ -976,13 +1017,13 @@ class Editor(DesktopWindow):
         self.progress.setValue(0)
         self.eta.reset()
         self.eta_label.clear()
-        self.info, encoders = result
+        self.info, encoders, *stale = result
         self.encoders_checked(encoders)
+        if stale and stale[0]:
+            self.refresh_encoders()
         self.crop, self.colors = None, (0., 1., 1.)
         self.video.source_size = (self.info['video']['width'], self.info['video']['height'])
-        self.video.frame_timer.stop()
-        self.video.pending_frame = None
-        self.video.set_image(QImage())
+        self.video.clear()
         self.update_preview()
         self.wave.duration = self.info['duration']
         self.reset_trim()
@@ -1215,6 +1256,9 @@ class Editor(DesktopWindow):
             if not job.wait(5000):
                 self.status.setText('Stopping waveform analysis; close again in a moment.')
                 return False
+        if self.encoder_refresh is not None and not self.encoder_refresh.wait(5000):
+            self.status.setText('Finishing the encoder check; close again in a moment.')
+            return False
         self.release_media()
         if self.preview_temp:
             try:

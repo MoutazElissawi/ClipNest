@@ -28,12 +28,13 @@ class NativeEngine:
         self.encoders, self.callbacks, self.meters = [], [], []
         self.ui_tasks = None
         self.source_meters = {}
+        self.meters_shown = True  # detached meters cost OBS's audio thread nothing
         self.input_settings = {}
         self.screen_transform = None
         self.screen_transforms = {}
         self.stop_events, self.stop_codes = {}, {}
         self.stopping = set()
-        self.record_path = self.last_replay = ""
+        self.record_path = ""
         self.record_start = 0
         self.settings = {}
         self.com_initialized = False
@@ -199,12 +200,26 @@ class NativeEngine:
         self.encoders.append(video)
         l.obs_encoder_set_video(video, l.obs_get_video())
         audio = []
-        from .config import app_track_name
-        game_audio = s.get("capture_target") == "games" and s.get("game_audio_only")
-        names = ["Mix", "Game" if game_audio else "Desktop", "Microphone"] + ([app_track_name(s["app_audio"]) or "Application"] if s.get("app_audio") else [])
-        for index, name in enumerate(names):
+        from .config import GAME_TRACK, app_track_name, track_layout
+        games = s.get("capture_target") == "games"
+        layout = track_layout(s)
+        if layout is not None:
+            # One track per app: the chosen sources in order, each on its own mixer.
+            names = [title for title, _, _ in layout]
+            mixers = list(range(len(layout)))
+        else:
+            names = ["Mix", "Game" if games and s.get("game_audio_only") else "Desktop", "Microphone"]
+            mixers = [0, 1, 2]
+            if s.get("app_audio"):
+                names.append(app_track_name(s["app_audio"]) or "Application")
+                mixers.append(3)
+            if games and s.get("game_audio_track"):
+                # Stays silent when the engine cannot add the game's audio source (older Windows).
+                names.append("Game")
+                mixers.append(GAME_TRACK - 1)
+        for name, mixer in zip(names, mixers):
             with l.data({"bitrate": s.get('mic_bitrate' if name == 'Microphone' else 'audio_bitrate', 192)}) as data:
-                enc = l.obs_audio_encoder_create(b"ffmpeg_aac", utf8(name), data, index, None)
+                enc = l.obs_audio_encoder_create(b"ffmpeg_aac", utf8(name), data, mixer, None)
             if not enc: raise RuntimeError(f"Could not create AAC encoder for {name}.")
             self.encoders.append(enc)
             audio.append(enc)
@@ -253,8 +268,7 @@ class NativeEngine:
             return
         def saved(_param, _data):
             try:
-                self.last_replay = l.procedure(self.outputs["replay"], "get_last_replay", "path")
-                self.emit("ReplayBufferSaved", {"savedReplayPath": self.last_replay})
+                self.emit("ReplayBufferSaved", {"savedReplayPath": l.procedure(self.outputs["replay"], "get_last_replay", "path")})
             except Exception as exc:
                 self.emit("NativeWarning", {"message": str(exc)})
         callback = SIGNAL(saved)
@@ -266,24 +280,36 @@ class NativeEngine:
         if not self.active(kind) and kind not in self.stopping:
             self.release_idle_capture()
             return
-        event = self.stop_events[kind]
-        # Clear only on the first request. A late completion must survive retries.
+        # start() clears the event. A stop libobs already signalled, from an earlier
+        # request or an output error, is never signalled again, so never clear it here.
         if kind not in self.stopping:
             self.stopping.add(kind)
-            event.clear()
             self.lib.obs_output_stop(self.outputs[kind])
-        if not event.wait(8):
+        if not self.stopped(kind, 8):
             self.emit("NativeNotice", {"message": f"{kind.capitalize()} is slow to stop; asking the recorder to finish immediately."})
             # libobs still finalizes the muxer and emits its completion signal.
             # This is not process termination; queued tail frames may be omitted.
             self.lib.obs_output_force_stop(self.outputs[kind])
-            if not event.wait(3):
+            if not self.stopped(kind, 3):
                 raise RuntimeError(f"{kind.capitalize()} has not finished closing. Check native-engine.log.")
         self.stopping.discard(kind)
         if kind == "replay" and self.settings.get("replay_mode") == "continuous" and self.segment_path:
             self.emit("ReplaySegmentClosed", {"path": self.segment_path, "next": None, "save": False})
             self.segment_path = ""
         self.release_idle_capture()
+
+    def stopped(self, kind, timeout):
+        """libobs signals "stop" before its end_data_capture_thread detaches the
+        encoders and clears active. A stop request in that gap is ignored and
+        never signals again, so wait for both (every quit stalled, beta.9-2.1.0)."""
+        deadline = time.monotonic() + timeout
+        if not self.stop_events[kind].wait(timeout):
+            return False
+        while self.active(kind):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(.01)
+        return True
 
     def start(self, kind):
         self.make_outputs()
@@ -334,7 +360,7 @@ class NativeEngine:
         meter = l.obs_volmeter_create(0)
         if not meter: return
         last = [0.0]
-        def update(_param, magnitude, peak, input_peak):
+        def update(_param, _magnitude, peak, _input_peak):
             now = time.monotonic()
             if now - last[0] < .1: return
             last[0] = now
@@ -345,9 +371,19 @@ class NativeEngine:
             self.emit("InputVolumeMeters", {"inputs": [{"inputName": name, "inputLevelsMul": channels}]})
         callback = METER(update)
         l.obs_volmeter_add_callback(meter, callback, None)
-        l.obs_volmeter_attach_source(meter, source)
+        if self.meters_shown:
+            l.obs_volmeter_attach_source(meter, source)
         self.meters.append((meter, callback))
         self.source_meters[name] = meter
+
+    def show_meters(self, shown):
+        """OBS measures a source only while its meter is attached; nobody sees the meters behind a game."""
+        self.meters_shown = shown
+        for name, meter in self.source_meters.items():
+            if shown:
+                self.lib.obs_volmeter_attach_source(meter, self.inputs[name][0])
+            else:
+                self.lib.obs_volmeter_detach_source(meter)
 
     def reconnect_audio(self, sources):
         """Replace endpoint clients, keeping video and the three encoded tracks alive.
@@ -384,11 +420,10 @@ class NativeEngine:
             l.obs_source_set_muted(old, True)
             l.obs_source_set_audio_mixers(old, 0)
             l.obs_source_set_volume(source, spec['volume'])
-            l.obs_source_set_monitoring_type(source, 0)
-            if name in self.source_meters:
-                l.obs_volmeter_attach_source(self.source_meters[name], source)
-            else:
+            if name not in self.source_meters:
                 self.attach_meter(source, name)
+            elif self.meters_shown:
+                l.obs_volmeter_attach_source(self.source_meters[name], source)
             l.obs_sceneitem_remove(self.items[name])
             l.obs_source_release(old)
             l.obs_source_set_name(source, utf8(name))
@@ -421,7 +456,6 @@ class NativeEngine:
         elif method == "SetCurrentProgramScene": pass  # Attach only when an output starts.
         elif method == "GetInputKindList": return {"inputKinds": l.enumerate(l.obs_enum_input_types)}
         elif method == "GetInputList": return {"inputs": [{"inputName": n} for n in self.inputs]}
-        elif method == "GetSpecialInputs": return {}
         elif method == "CreateInput":
             with l.data(a["inputSettings"]) as data:
                 source = l.obs_source_create(utf8(a["inputKind"]), utf8(a["inputName"]), data, None)
@@ -435,7 +469,8 @@ class NativeEngine:
                 l.obs_sceneitem_set_visible(item, False)
             if a["inputKind"].startswith("wasapi"):
                 l.obs_source_set_muted(source, True)
-                self.attach_meter(source, a["inputName"])
+                if a.get("meter"):  # only sources the window shows a meter for
+                    self.attach_meter(source, a["inputName"])
         elif method == "GetInputPropertiesListPropertyItems": return self.properties(a.get("inputName", a.get("inputKind")), a["propertyName"], kind=a.get("inputKind"))
         elif method == "SetInputSettings":
             self.input_settings.setdefault(a["inputName"], {}).update(a["inputSettings"])
@@ -445,7 +480,7 @@ class NativeEngine:
         elif method == "SetInputAudioTracks":
             mask = sum(1 << (int(track) - 1) for track, enabled in a["inputAudioTracks"].items() if enabled)
             l.obs_source_set_audio_mixers(self.inputs[a["inputName"]][0], mask)
-        elif method == "SetInputAudioMonitorType": l.obs_source_set_monitoring_type(self.inputs[a["inputName"]][0], 0)
+        elif method == "SetMetersShown": self.show_meters(bool(a["shown"]))
         elif method == "GetSceneItemId": return {"sceneItemId": a["sourceName"]}
         elif method == "SetInputEnabled":
             # Disabled sources are not drawn but keep ticking, so a game hook stays attached.
@@ -472,11 +507,10 @@ class NativeEngine:
             elapsed = max(0, time.monotonic() - self.record_start) if self.active("record") else 0
             hours, rem = divmod(int(elapsed), 3600)
             minutes, seconds = divmod(rem, 60)
-            return {"outputActive": self.active("record"), "outputTimecode": f"{hours:02}:{minutes:02}:{seconds:02}",
+            return {"outputActive": self.active("record"), "replayActive": self.active("replay"),
+                    "outputTimecode": f"{hours:02}:{minutes:02}:{seconds:02}",
                     "captureAttached": self.capture_attached, "captureMethod": self.capture_method,
                     "sourceSize": [l.obs_source_get_width(self.inputs["CN Screen"][0]), l.obs_source_get_height(self.inputs["CN Screen"][0])],
-                    "gameLayerSize": ([l.obs_source_get_width(self.inputs["CN Game Layer"][0]), l.obs_source_get_height(self.inputs["CN Game Layer"][0])]
-                                      if "CN Game Layer" in self.inputs else None),
                     "stats": self.capture_stats()}
         elif method == "GetReplayBufferStatus": return {"outputActive": self.active("replay")}
         elif method == "StartRecord": self.start("record")
@@ -496,12 +530,8 @@ class NativeEngine:
             with l.data({"format": "Replay_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")}) as data:
                 l.obs_output_update(self.outputs["replay"], data)
             l.procedure(self.outputs["replay"], "save")
-        elif method == "GetLastReplayBufferReplay": return {"savedReplayPath": self.last_replay}
         else: raise RuntimeError(f"Unknown native-engine method: {method}")
         return {}
-
-    def before_source_shutdown(self):
-        pass
 
     def shutdown(self):
         if not self.started:
@@ -528,7 +558,6 @@ class NativeEngine:
 
     def release_native(self):
         l = self.lib
-        self.before_source_shutdown()
         for handler, name, callback in self.callbacks: l.signal_handler_disconnect(handler, name, callback, None)
         for output in self.outputs.values(): l.obs_output_release(output)
         for enc in self.encoders: l.obs_encoder_release(enc)

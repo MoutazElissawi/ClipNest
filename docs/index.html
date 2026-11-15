@@ -3,106 +3,402 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ClipNest: free instant replay and clip editor for Windows</title>
-<meta name="description" content="ClipNest is a free, open-source Windows screen recorder with instant replay, clips sorted by game automatically, and a built-in editor. A ShadowPlay alternative.">
+<title>ClipNest: free instant replay for PC games on Windows</title>
+<meta name="description" content="ClipNest keeps the last 90 seconds of your game ready and saves them as a clip with one key. Free and open source, sorted by game, with its own editor. A ShadowPlay alternative for NVIDIA, AMD and CPU.">
 <link rel="canonical" href="https://moutazelissawi.github.io/ClipNest/">
 <link rel="icon" type="image/png" href="favicon.png">
+<meta name="theme-color" content="#181818">
+<meta name="color-scheme" content="dark">
 <meta property="og:type" content="website">
-<meta property="og:title" content="ClipNest: record your best moments">
-<meta property="og:description" content="Free, open-source instant replay and clip editor for Windows.">
+<meta property="og:title" content="ClipNest: your best plays, saved">
+<meta property="og:description" content="Free, open source instant replay and clip editor for Windows.">
 <meta property="og:url" content="https://moutazelissawi.github.io/ClipNest/">
 <meta property="og:image" content="https://moutazelissawi.github.io/ClipNest/social-preview.jpg">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700&family=Barlow:wght@400;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css">
+<link rel="preload" href="fonts/manrope-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="site.css">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "ClipNest",
+  "description": "Free, open source instant replay screen recorder and clip editor for Windows. Clips are sorted by game automatically.",
+  "url": "https://moutazelissawi.github.io/ClipNest/",
+  "downloadUrl": "https://github.com/MoutazElissawi/ClipNest/releases/latest",
+  "image": "https://moutazelissawi.github.io/ClipNest/social-preview.jpg",
+  "applicationCategory": "MultimediaApplication",
+  "operatingSystem": "Windows 10, Windows 11",
+  "isAccessibleForFree": true,
+  "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {"@type": "Question", "name": "Is ClipNest really free?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. There is no trial, no watermark and no account. ClipNest is open source under GPL 2.0 or later."}},
+    {"@type": "Question", "name": "Is the installer safe to run?", "acceptedAnswer": {"@type": "Answer", "text": "It is built from the public source on GitHub, so you can read what it does or build it yourself. It installs for your user only and needs no admin rights."}},
+    {"@type": "Question", "name": "Why do I need FFmpeg?", "acceptedAnswer": {"@type": "Answer", "text": "ClipNest uses FFmpeg to save instant replays, run the editor and make thumbnails. It is free: download it once and pick its folder in the editor under File, FFmpeg folder."}},
+    {"@type": "Question", "name": "Does it record VALORANT?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. Games that hide from screen capture, like VALORANT, are recorded in Games only mode."}},
+    {"@type": "Question", "name": "How long can the replay be?", "acceptedAnswer": {"@type": "Answer", "text": "90 seconds by default. You can raise it to as much as 30 minutes in Settings."}},
+    {"@type": "Question", "name": "How is it different from ShadowPlay or Medal?", "acceptedAnswer": {"@type": "Answer", "text": "ClipNest works with NVIDIA, AMD or CPU encoding, needs no account, uploads nothing, keeps each app's audio on its own track and files clips by game on your own drive."}}
+  ]
+}
+</script>
 </head>
 <body>
-<header class="hero">
-  <img src="hero-frame.jpg" width="1600" height="860" alt="">
-  <nav class="nav" aria-label="Main">
-    <div class="container">
-      <a class="wordmark" href="./"><img src="logo.png" alt="">ClipNest</a>
-      <a href="https://github.com/MoutazElissawi/ClipNest">Source on GitHub</a>
-    </div>
-  </nav>
-  <div class="container">
-    <div class="panel">
-      <h1>Record your best moments.</h1>
-      <p>Save up to 30 minutes of recent gameplay with any hotkey.</p>
-      <div class="actions"><a class="button" href="https://github.com/MoutazElissawi/ClipNest/releases/latest">Download for Windows</a></div>
-      <p class="small">Free and open source, for Windows 10 and 11.</p>
-    </div>
-    <img class="window" src="app-main.png" width="1500" height="940" alt="ClipNest running over the game with instant replay ready">
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="bar">
+  <div class="frame bar__inner">
+    <a class="wordmark" href="./" aria-label="ClipNest home" translate="no"><img src="logo.png" width="28" height="28" alt="">ClipNest</a>
+    <nav aria-label="Main">
+      <ul class="bar__links">
+        <li><a href="#features">Features</a></li>
+        <li><a href="#editor">Editor</a></li>
+        <li><a href="#faq">FAQ</a></li>
+      </ul>
+    </nav>
+    <a class="button button--small" href="https://github.com/MoutazElissawi/ClipNest/releases/latest">Download</a>
   </div>
 </header>
 
-<main>
-  <section class="band" aria-labelledby="sorted">
-    <div class="container split">
-      <img class="shot" src="valorant-58.jpg" width="1600" height="900" loading="lazy" alt="A saved Valorant clip">
-      <div>
-        <h2 id="sorted">Sorted by the game you played.</h2>
-        <h3 class="sub">Auto-detect games</h3>
-        <p>ClipNest reads which game is running and saves the clip in a folder with its name, even for games that hide from screen capture, like Valorant.</p>
-        <ul class="games"><li>Valorant</li><li>Helldivers 2</li><li>Rocket League</li><li>Chivalry 2</li><li>Desktop</li></ul>
+<main id="main">
+  <!-- Hero: the one interaction that is the product -->
+  <section class="hero frame" aria-labelledby="hero-title">
+    <div class="hero__copy" data-reveal>
+      <h1 id="hero-title" class="heading-1">Your best plays, saved.</h1>
+      <p class="hero__lead body-lead">Free instant replay for Windows. <span translate="no">ClipNest</span> keeps the last 90 seconds of your game ready, and one key turns them into a clip.</p>
+      <div class="hero__actions">
+        <a class="button magnet" href="https://github.com/MoutazElissawi/ClipNest/releases/latest">
+          <svg aria-hidden="true" viewBox="0 0 256 256"><path d="M228,144v64a12,12,0,0,1-12,12H40a12,12,0,0,1-12-12V144a12,12,0,0,1,24,0v52H204V144a12,12,0,0,1,24,0Zm-108.49,8.49a12,12,0,0,0,17,0l40-40a12,12,0,0,0-17-17L140,115V32a12,12,0,0,0-24,0v83L96.49,95.51a12,12,0,0,0-17,17Z"/></svg>
+          Download for Windows</a>
+        <a class="textlink" href="https://github.com/MoutazElissawi/ClipNest/tree/linux">Linux build on GitHub
+          <svg aria-hidden="true" viewBox="0 0 256 256"><path d="M224.49,136.49l-72,72a12,12,0,0,1-17-17L187,140H40a12,12,0,0,1,0-24H187L135.51,64.48a12,12,0,0,1,17-17l72,72A12,12,0,0,1,224.49,136.49Z"/></svg></a>
       </div>
+      <p class="caption">Free and open source under GPL 2.0. No account, nothing uploaded.</p>
+    </div>
+
+    <div class="replay" data-ui data-reveal aria-label="Try instant replay">
+      <div class="replay__top">
+        <span class="replay__rec"><i aria-hidden="true"></i>Recording Valorant</span>
+        <button class="replay__pause" type="button" aria-label="Pause the gameplay video">
+          <svg class="i-pause" aria-hidden="true" viewBox="0 0 256 256"><path d="M200,28H160a20,20,0,0,0-20,20V208a20,20,0,0,0,20,20h40a20,20,0,0,0,20-20V48A20,20,0,0,0,200,28Zm-4,176H164V52h32ZM96,28H56A20,20,0,0,0,36,48V208a20,20,0,0,0,20,20H96a20,20,0,0,0,20-20V48A20,20,0,0,0,96,28ZM92,204H60V52H92Z"/></svg>
+          <svg class="i-play" aria-hidden="true" viewBox="0 0 256 256"><path d="M234.49,111.07,90.41,22.94A20,20,0,0,0,60,39.87V216.13a20,20,0,0,0,30.41,16.93l144.08-88.13a19.82,19.82,0,0,0,0-33.86ZM84,208.85V47.15L216.16,128Z"/></svg>
+        </button>
+      </div>
+      <div class="replay__screen">
+        <video class="replay__video" src="media/hero-ace.mp4" poster="media/hero-ace.jpg" width="1280" height="720" autoplay muted loop playsinline preload="metadata" aria-label="An ace in VALORANT, recorded with ClipNest"></video>
+        <div class="toast" role="status" aria-live="polite"></div>
+      </div>
+      <div class="replay__controls">
+        <div class="buffer">
+          <span class="buffer__label">Replay buffer</span>
+          <span class="buffer__track"><span class="buffer__fill"></span></span>
+          <span class="buffer__value">90&nbsp;s</span>
+        </div>
+        <button class="keycap" type="button" aria-keyshortcuts="S">Save clip <kbd>S</kbd></button>
+      </div>
+      <ol class="saved" aria-label="Saved clips"></ol>
+      <p class="replay__hint">Press S or the key to save the last 90 seconds.</p>
     </div>
   </section>
 
-  <section class="band tight" aria-labelledby="edit">
-    <div class="container split flip">
-      <div>
-        <h2 id="edit">Built-in editor for your convenience</h2>
-        <ul class="points">
-          <li>Separate audio tracks</li>
-          <li>Edit audio separately from video</li>
-          <li>Combine two clips into one with zero delay between them</li>
+  <!-- Games are filed by name: the headline you can type -->
+  <section class="sorting frame" id="sorting" aria-labelledby="sorting-title">
+    <h2 id="sorting-title" class="heading-3" data-reveal>Every clip lands in its game’s folder.</h2>
+    <label class="sorting__label caption" for="game-input">Type a game</label>
+    <div class="sorting__line" data-reveal>
+      <input id="game-input" class="sorting__input heading-1" data-ui type="text" value="Valorant" spellcheck="false" autocomplete="off" maxlength="40">
+    </div>
+    <div class="sorting__answer" data-ui aria-live="polite" data-reveal>
+      <div class="path"><span class="path__root">Clips</span><span class="path__sep" aria-hidden="true">›</span><span class="path__game">Valorant</span></div>
+      <div class="file"><span class="file__name">Valorant_2026-11-06_21-04-17.mkv</span><span class="file__len">01:30</span></div>
+      <p class="sorting__note">Hides from normal screen capture. Games only mode records it anyway.</p>
+    </div>
+    <div class="sorting__examples" data-reveal>
+      <span class="caption">Try</span>
+      <button type="button" data-game="Helldivers 2">Helldivers 2</button>
+      <button type="button" data-game="Rocket League">Rocket League</button>
+      <button type="button" data-game="Fortnite">Fortnite</button>
+    </div>
+  </section>
+
+  <!-- The 33 second tour -->
+  <section class="tour frame" aria-labelledby="tour-title">
+    <div class="tour__head" data-reveal>
+      <h2 id="tour-title" class="heading-3">See it work in 33 seconds.</h2>
+      <p class="body-3">Save, sort, mute, trim and find the export again, all inside <span translate="no">ClipNest</span>. Sound on.</p>
+    </div>
+    <div class="tour__player" data-reveal>
+      <video src="media/tour.mp4" poster="media/tour.jpg" width="1280" height="720" controls preload="none" playsinline aria-label="ClipNest tour: saving a VALORANT ace, recording only the game, the editor and the clip gallery"></video>
+    </div>
+  </section>
+
+  <!-- Capabilities: small proof beside text -->
+  <section class="features frame" id="features" aria-labelledby="features-title">
+    <h2 id="features-title" class="heading-3" data-reveal>What it records, and what it leaves out.</h2>
+
+    <article class="module" data-reveal>
+      <div class="module__panel module__panel--photo" data-ui>
+        <img src="media/helldivers.jpg" width="960" height="540" loading="lazy" alt="Helldivers 2 gameplay being recorded on its own">
+        <span class="recpill"><i aria-hidden="true"></i>REC  Helldivers 2</span>
+      </div>
+      <div class="module__text">
+        <h3 class="body-1">Just the game, or everything</h3>
+        <p class="body-3">Games only is the default. <span translate="no">ClipNest</span> follows the game you are playing and leaves your desktop, chat and browser out of the clip.</p>
+        <p class="body-3 muted">Want the whole screen? Record one display, every display stitched together, or a single window.</p>
+      </div>
+    </article>
+
+    <article class="module" data-reveal>
+      <div class="module__panel" data-ui>
+        <table class="tracks">
+          <caption class="visually-hidden">Audio tracks in a saved clip</caption>
+          <thead><tr><th scope="col">Keep</th><th scope="col">Audio track</th><th scope="col" class="num">Gain %</th><th scope="col" class="end">Listen</th></tr></thead>
+          <tbody>
+            <tr><td><input type="checkbox" checked aria-label="Keep Mix"></td><td>1: Mix</td><td class="num">100</td><td class="end"><button type="button" class="ui-button" aria-pressed="false">Listen solo</button></td></tr>
+            <tr><td><input type="checkbox" checked aria-label="Keep Game"></td><td>2: Game</td><td class="num">100</td><td class="end"><button type="button" class="ui-button" aria-pressed="true">Listening</button></td></tr>
+            <tr><td><input type="checkbox" aria-label="Keep Discord"></td><td>3: Discord</td><td class="num">100</td><td class="end"><button type="button" class="ui-button" aria-pressed="false">Listen solo</button></td></tr>
+            <tr><td><input type="checkbox" aria-label="Keep Spotify"></td><td>4: Spotify</td><td class="num">100</td><td class="end"><button type="button" class="ui-button" aria-pressed="false">Listen solo</button></td></tr>
+            <tr><td><input type="checkbox" checked aria-label="Keep Chrome"></td><td>5: Chrome</td><td class="num">100</td><td class="end"><button type="button" class="ui-button" aria-pressed="false">Listen solo</button></td></tr>
+            <tr><td><input type="checkbox" checked aria-label="Keep Microphone"></td><td>6: Microphone</td><td class="num">100</td><td class="end"><button type="button" class="ui-button" aria-pressed="false">Listen solo</button></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="module__text">
+        <h3 class="body-1">Every app on its own track</h3>
+        <p class="body-3">Game, Discord, Spotify, Chrome and your microphone each get their own audio track. Cut the music later and keep the game.</p>
+        <p class="body-3 muted">Mix still holds everything, for anyone who wants one track.</p>
+      </div>
+    </article>
+
+    <article class="module" id="editor" data-reveal>
+      <div class="module__panel" data-ui>
+        <div class="wave" role="img" aria-label="Desktop track waveform with a muted stretch from 10.2 to 12.9 seconds">
+          <svg class="wave__svg" viewBox="0 0 360 64" preserveAspectRatio="none" aria-hidden="true"></svg>
+          <span class="wave__mute"></span>
+        </div>
+        <div class="wave__bar">
+          <span>Desktop: 10.200 to 12.900 s selected</span>
+          <button type="button" class="ui-button" aria-pressed="true">Mute</button>
+        </div>
+      </div>
+      <div class="module__text">
+        <h3 class="body-1">Mute a moment, not the whole track</h3>
+        <p class="body-3">Shift and drag over a waveform, then mute just that stretch. The shout goes, the shot stays.</p>
+        <p class="body-3 muted">Each track keeps its own muted parts, so the game and your voice never fight.</p>
+      </div>
+    </article>
+
+    <article class="module" data-reveal>
+      <div class="module__panel" data-ui>
+        <div class="trim">
+          <label>Start <output>8.500&nbsp;s</output></label>
+          <label>End <output>17.200&nbsp;s</output></label>
+        </div>
+        <div class="formats" role="radiogroup" aria-label="Export format">
+          <button type="button" role="radio" aria-checked="false">MKV</button>
+          <button type="button" role="radio" aria-checked="false">MP4</button>
+          <button type="button" role="radio" aria-checked="false">MP3</button>
+          <button type="button" role="radio" aria-checked="false">WAV</button>
+          <button type="button" role="radio" aria-checked="true">Copy</button>
+        </div>
+        <p class="formats__note">Copy: no re-encode, done in seconds</p>
+      </div>
+      <div class="module__text">
+        <h3 class="body-1">Trim and export in seconds</h3>
+        <p class="body-3">Set a start and an end, then export to MKV, MP4, MP3, M4A, WAV or FLAC. Copy mode skips encoding entirely.</p>
+        <p class="body-3 muted">Crop and colour adjustments are there too, for the clip you post.</p>
+      </div>
+    </article>
+
+    <article class="module" data-reveal>
+      <div class="module__panel" data-ui>
+        <ul class="encoders" aria-label="Encoders found on the developer’s PC">
+          <li><span>NVIDIA H.264</span><span class="ok">Ready</span></li>
+          <li><span>NVIDIA AV1</span><span class="ok">Ready</span></li>
+          <li><span>AMD H.264</span><span class="ok">Ready</span></li>
+          <li><span>AMD HEVC</span><span class="ok">Ready</span></li>
+          <li><span>CPU H.264</span><span class="ok">Ready</span></li>
         </ul>
-        <p>Trim to the frame, crop, or mute your mic for a moment and keep the game audio. Copy mode exports in seconds with no re-encode.</p>
       </div>
-      <img class="shot" src="editor-rocket-league.webp" width="1950" height="1250" loading="lazy" alt="The ClipNest editor with a Rocket League clip, a selected stretch of audio and three audio tracks">
+      <div class="module__text">
+        <h3 class="body-1">NVIDIA, AMD or your CPU</h3>
+        <p class="body-3">Hardware encoding runs on NVIDIA and AMD graphics cards, and CPU encoding always works. No brand lock in.</p>
+        <p class="body-3 muted">The list comes straight from the editor, which tests each encoder on your machine.</p>
+      </div>
+    </article>
+  </section>
+
+  <!-- Why it exists: the tagline reveal over four columns -->
+  <section class="why frame" aria-labelledby="why-title">
+    <h2 id="why-title" class="visually-hidden">Why ClipNest</h2>
+    <p class="why__lead heading-3" data-words>Play like nobody is recording. ClipNest already is, and one key keeps the last 90 seconds.</p>
+    <div class="why__cols" data-reveal>
+      <p class="body-6"><b>Built on OBS.</b> Recording runs on the open source engine behind OBS Studio, with instant replay, game folders and an editor built around it.</p>
+      <p class="body-6"><b>Nothing leaves your PC.</b> No account and no uploads. The one download is the recording engine on first launch, straight from OBS’s releases on GitHub.</p>
+      <p class="body-6"><b>Games that hide.</b> VALORANT and other games block normal screen capture. Games only mode records them anyway, and keeps the game in frame through Alt+Tab.</p>
+      <p class="body-6"><b>Open source.</b> Every line is on GitHub under GPL 2.0 or later. Read it, build it yourself, or open an issue when something breaks.</p>
     </div>
   </section>
 
-  <section class="specs" aria-labelledby="needs">
-    <div class="container">
-      <h2 id="needs">What you need</h2>
-      <dl>
-        <dt>System</dt><dd>Windows 10/11, 64-bit</dd>
-        <dt>Price</dt><dd>Free</dd>
-      </dl>
+  <!-- Gallery: real clips with their real numbers -->
+  <section class="clips frame" id="clips" aria-labelledby="clips-title">
+    <div class="clips__head" data-reveal>
+      <h2 id="clips-title" class="heading-3">Straight from a real library.</h2>
+      <div class="tabs" role="tablist" aria-label="Filter clips by game">
+        <span class="tabs__fill" aria-hidden="true"></span>
+        <button type="button" role="tab" aria-selected="true" data-filter="all">All</button>
+        <button type="button" role="tab" aria-selected="false" data-filter="Valorant">Valorant</button>
+        <button type="button" role="tab" aria-selected="false" data-filter="Helldivers 2">Helldivers 2</button>
+        <button type="button" role="tab" aria-selected="false" data-filter="Rocket League">Rocket League</button>
+        <button type="button" role="tab" aria-selected="false" data-filter="other">Other</button>
+      </div>
     </div>
+    <ul class="tiles" data-reveal>
+      <li class="tile" data-game="Valorant"><img src="media/tile-valorant-2026-11-04-03-35-28-808155.jpg" width="720" height="720" loading="lazy" alt="VALORANT clip, a defuse in progress"><div class="strip strip--a"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-04T03:35">Nov 4, 2026</time><span>03:35</span></p><p class="strip__game">Valorant</p></div></li>
+      <li class="tile" data-game="Helldivers 2"><img src="media/tile-helldivers-2-2026-11-04-02-34-02-546918.jpg" width="720" height="720" loading="lazy" alt="Helldivers 2 clip, a shuttle about to depart"><div class="strip strip--b"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-04T02:34">Nov 4, 2026</time><span>02:34</span></p><p class="strip__game">Helldivers 2</p></div></li>
+      <li class="tile" data-game="Rocket League"><img src="media/tile-rocket-league-2026-11-05-05-43-36-302472.jpg" width="720" height="720" loading="lazy" alt="Rocket League clip, the ball high above the goal"><div class="strip strip--c"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-05T05:43">Nov 5, 2026</time><span>05:43</span></p><p class="strip__game">Rocket League</p></div></li>
+      <li class="tile" data-game="other"><img src="media/tile-fortnite-2026-11-05-02-50-57-352282.jpg" width="720" height="720" loading="lazy" alt="Fortnite clip, gliding over trees"><div class="strip strip--d"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-05T02:50">Nov 5, 2026</time><span>02:50</span></p><p class="strip__game">Fortnite</p></div></li>
+      <li class="tile" data-game="Valorant"><img src="media/tile-valorant-2026-11-04-03-14-44-683968.jpg" width="720" height="720" loading="lazy" alt="VALORANT clip, planting the spike"><div class="strip strip--b"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-04T03:14">Nov 4, 2026</time><span>03:14</span></p><p class="strip__game">Valorant</p></div></li>
+      <li class="tile" data-game="Helldivers 2"><img src="media/tile-helldivers-2-2026-11-03-01-20-38-637477.jpg" width="720" height="720" loading="lazy" alt="Helldivers 2 clip, a drop pod in the rain"><div class="strip strip--c"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-03T01:20">Nov 3, 2026</time><span>01:20</span></p><p class="strip__game">Helldivers 2</p></div></li>
+      <li class="tile" data-game="Rocket League"><img src="media/tile-rocket-league-2026-11-04-02-38-58-911795.jpg" width="720" height="720" loading="lazy" alt="Rocket League clip, boosting toward the ball"><div class="strip strip--d"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-04T02:38">Nov 4, 2026</time><span>02:38</span></p><p class="strip__game">Rocket League</p></div></li>
+      <li class="tile" data-game="other"><img src="media/tile-crab-champions-2026-11-05-04-40-48-061339.jpg" width="720" height="720" loading="lazy" alt="Crab Champions clip, a fight on a red island"><div class="strip strip--a"><p class="strip__row"><span>01:30</span><span>1920×1080</span><span>90&nbsp;fps</span><span>6 tracks</span></p><p class="strip__row"><time datetime="2026-11-05T04:40">Nov 5, 2026</time><span>04:40</span></p><p class="strip__game">Crab Champions</p></div></li>
+    </ul>
   </section>
 
-  <section class="band install" aria-labelledby="start">
-    <div class="container">
-      <h2 id="start">Three steps and you’re recording</h2>
-      <ol>
-        <li><b>Install it</b><span>Run the setup file from the latest release. No admin rights.</span></li>
-        <li><b>Add FFmpeg</b><span>In the editor, go to File → FFmpeg folder → the folder with <code>ffmpeg.exe</code>.</span></li>
-        <li><b>Play</b><span>Start replay, then press your hotkey when something happens.</span></li>
+  <!-- Requirements as two ended rows -->
+  <section class="needs frame" id="needs" aria-labelledby="needs-title">
+    <div class="needs__col" data-reveal>
+      <h2 id="needs-title" class="heading-3">What you need</h2>
+      <p class="needs__group">Your PC</p>
+      <ul class="rows">
+        <li><span class="dot" aria-hidden="true"></span><span class="rows__name">Windows</span><span class="rows__value">10 (2004 or newer) or 11, 64 bit</span></li>
+        <li><span class="dot" aria-hidden="true"></span><span class="rows__name">Graphics</span><span class="rows__value">NVIDIA or AMD, or CPU encoding</span></li>
+        <li><span class="dot" aria-hidden="true"></span><span class="rows__name">FFmpeg</span><span class="rows__value">Free, added once in the editor</span></li>
+      </ul>
+      <p class="needs__group">Cost</p>
+      <ul class="rows">
+        <li><span class="dot dot--accent" aria-hidden="true"></span><span class="rows__name">Price</span><span class="rows__value">Free</span></li>
+        <li><span class="dot dot--accent" aria-hidden="true"></span><span class="rows__name">Account</span><span class="rows__value">None</span></li>
+        <li><span class="dot dot--accent" aria-hidden="true"></span><span class="rows__name">Licence</span><span class="rows__value">GPL 2.0 or later</span></li>
+      </ul>
+      <p class="needs__group">Elsewhere</p>
+      <ul class="rows">
+        <li><span class="dot" aria-hidden="true"></span><span class="rows__name">Linux</span><span class="rows__value"><a href="https://github.com/MoutazElissawi/ClipNest/tree/linux">The linux branch</a></span></li>
+      </ul>
+    </div>
+    <figure class="needs__shot" data-reveal>
+      <img src="media/close-helldivers.jpg" width="750" height="900" loading="lazy" alt="A Helldivers 2 firefight recorded with ClipNest">
+      <figcaption class="caption">Helldivers 2, recorded in Games only mode.</figcaption>
+    </figure>
+  </section>
+
+  <!-- How it works: drag through the stages -->
+  <section class="steps" id="start" aria-labelledby="steps-title">
+    <div class="steps__fields">
+      <div class="steps__clause">
+        <h2 id="steps-title" class="heading-3">Set up in three steps</h2>
+        <p class="steps__now heading-1" aria-live="polite">First, run the installer.</p>
+      </div>
+      <div class="steps__stage" data-ui>
+        <div class="stage is-on" data-stage="0">
+          <p class="stage__title">ClipNest-Setup-x64.exe</p>
+          <p class="stage__line">Installs for your user only</p>
+          <p class="stage__line">No admin rights needed</p>
+          <span class="ui-button ui-button--accent">Install</span>
+        </div>
+        <div class="stage" data-stage="1">
+          <p class="stage__title">File</p>
+          <p class="stage__line">Open clip…</p>
+          <p class="stage__line is-hover">FFmpeg folder…</p>
+          <p class="stage__line">Default export folder…</p>
+        </div>
+        <div class="stage" data-stage="2">
+          <p class="stage__title">Instant replay</p>
+          <p class="stage__big">90 sec</p>
+          <span class="ui-button ui-button--accent">Save replay</span>
+          <p class="stage__line">Your hotkey saves it from inside the game</p>
+        </div>
+      </div>
+    </div>
+    <div class="steps__slider frame">
+      <input class="steps__range" type="range" min="0" max="2" step="1" value="0" aria-label="Setup step" aria-valuetext="Run the installer">
+      <ol class="steps__names">
+        <li class="is-on">Install</li>
+        <li>Add FFmpeg</li>
+        <li>Press your hotkey</li>
       </ol>
     </div>
   </section>
+
+  <!-- FAQ: question index, one answer -->
+  <section class="faq frame" id="faq" aria-labelledby="faq-title">
+    <div class="faq__list" data-reveal>
+      <h2 id="faq-title" class="faq__heading">Questions, answered</h2>
+      <ul role="list">
+        <li><button type="button" aria-expanded="true" aria-controls="a1">Is ClipNest really free?</button><div class="faq__answer" id="a1"><p>Yes. There is no trial, no watermark and no account. <span translate="no">ClipNest</span> is open source under GPL 2.0 or later.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a2">Is the installer safe to run?</button><div class="faq__answer" id="a2" hidden><p>It is built from the public source on GitHub, so you can read what it does or build it yourself. It installs for your user only and needs no admin rights.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a3">Why do I need FFmpeg?</button><div class="faq__answer" id="a3" hidden><p><span translate="no">ClipNest</span> uses FFmpeg to save instant replays, run the editor and make thumbnails. It is free: download it once, then pick its folder in the editor under File, FFmpeg folder.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a4">Does it record VALORANT?</button><div class="faq__answer" id="a4" hidden><p>Yes. Games that hide from screen capture, like VALORANT, are recorded in Games only mode.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a5">How long can the replay be?</button><div class="faq__answer" id="a5" hidden><p>90 seconds by default. You can raise it to as much as 30 minutes in Settings.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a6">Will it slow my game down?</button><div class="faq__answer" id="a6" hidden><p>On NVIDIA and AMD cards it records with the graphics card’s own video encoder, the same way OBS does, which is much lighter than encoding on the processor. CPU encoding is there for everything else.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a7">How is it different from ShadowPlay or Medal?</button><div class="faq__answer" id="a7" hidden><p><span translate="no">ClipNest</span> works with NVIDIA, AMD or CPU encoding, needs no account, uploads nothing, keeps each app’s audio on its own track and files clips by game on your own drive.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a8">Can I record without instant replay?</button><div class="faq__answer" id="a8" hidden><p>Yes. Manual recording runs at the same time as instant replay, on its own hotkey.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a9">Where do my clips go?</button><div class="faq__answer" id="a9" hidden><p>Into the folder you choose, one subfolder per game. Uninstalling keeps your clips and your settings.</p></div></li>
+        <li><button type="button" aria-expanded="false" aria-controls="a10">Is there a Linux version?</button><div class="faq__answer" id="a10" hidden><p>Yes, on the <a href="https://github.com/MoutazElissawi/ClipNest/tree/linux">linux branch</a> on GitHub.</p></div></li>
+      </ul>
+    </div>
+    <div class="faq__pane" aria-hidden="true">
+      <p class="faq__shown body-7">Yes. There is no trial, no watermark and no account. ClipNest is open source under GPL 2.0 or later.</p>
+    </div>
+  </section>
+
+  <!-- The close: one row of the board -->
+  <section class="close" id="download" aria-labelledby="close-title">
+    <div class="close__side close__side--photo" aria-hidden="true">
+      <img class="is-on" src="media/close-valorant.jpg" width="750" height="900" loading="lazy" alt="">
+      <img src="media/close-helldivers.jpg" width="750" height="900" loading="lazy" alt="">
+      <img src="media/close-rocket.jpg" width="750" height="900" loading="lazy" alt="">
+    </div>
+    <div class="close__tile" data-reveal>
+      <div class="close__main">
+      <h2 id="close-title" class="heading-3">Your next clip is one key away.</h2>
+      <div class="hero__actions">
+        <a class="button button--dark button--large magnet" href="https://github.com/MoutazElissawi/ClipNest/releases/latest">
+          <svg aria-hidden="true" viewBox="0 0 256 256"><path d="M228,144v64a12,12,0,0,1-12,12H40a12,12,0,0,1-12-12V144a12,12,0,0,1,24,0v52H204V144a12,12,0,0,1,24,0Zm-108.49,8.49a12,12,0,0,0,17,0l40-40a12,12,0,0,0-17-17L140,115V32a12,12,0,0,0-24,0v83L96.49,95.51a12,12,0,0,0-17,17Z"/></svg>
+          Download for Windows</a>
+        <a class="textlink textlink--dark" href="https://github.com/MoutazElissawi/ClipNest/tree/linux">Linux build</a>
+      </div>
+      </div>
+      <div class="close__info">
+        <p class="close__release">Free for Windows 10 and 11</p>
+        <ul class="close__facts body-3">
+          <li>No admin rights needed</li>
+          <li>No account, nothing uploaded</li>
+          <li>Uninstalling keeps every clip</li>
+        </ul>
+      </div>
+    </div>
+    <div class="close__side close__side--flat" aria-hidden="true"></div>
+  </section>
 </main>
 
-<footer class="foot">
-  <div class="container">
-    <span>ClipNest, GPL-2.0-or-later, built on the OBS recording engine.</span>
-    <span>Not affiliated with OBS, NVIDIA, AMD or Riot Games.</span>
-  </div>
+<footer class="foot frame">
+  <p class="foot__what"><span translate="no">ClipNest</span>, free instant replay. Not affiliated with OBS, NVIDIA, AMD or Riot Games.</p>
+  <ul class="foot__links">
+    <li><a href="https://github.com/MoutazElissawi/ClipNest">Source</a></li>
+    <li><a href="https://github.com/MoutazElissawi/ClipNest/releases">Releases</a></li>
+    <li><a href="https://github.com/MoutazElissawi/ClipNest/blob/master/LICENSE.txt">Licence</a></li>
+  </ul>
+  <p class="foot__end">2026 · <a href="privacy.html">Privacy</a></p>
 </footer>
-<a class="scroll-cue" href="#sorted" aria-label="Scroll to see more">
-  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
-</a>
-<script>
-  // Hide the scroll hint as soon as the visitor starts scrolling.
-  const cue = document.querySelector('.scroll-cue');
-  const update = () => cue.classList.toggle('is-hidden', window.scrollY > 40);
-  window.addEventListener('scroll', update, { passive: true });
-  update();
-</script>
+
+<script src="vendor/gsap.min.js" defer></script>
+<script src="vendor/ScrollTrigger.min.js" defer></script>
+<script src="vendor/lenis.min.js" defer></script>
+<script src="site.js" defer></script>
 </body>
 </html>

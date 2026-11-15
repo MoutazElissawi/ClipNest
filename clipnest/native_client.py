@@ -1,4 +1,5 @@
 """Request/reply transport to our own libobs process over anonymous pipes."""
+import itertools
 import json
 import logging
 import os
@@ -9,7 +10,6 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
 from .config import DATA, ENGINE
 
 
@@ -41,9 +41,11 @@ def host_command(env):
 class NativeError(RuntimeError): pass
 
 class NativeClient:
-    def __init__(self, settings, event_callback=lambda *_: None, command=None):
+    def __init__(self, settings, event_callback=lambda *_: None, command=None, wake=lambda: None):
         self.event_callback = event_callback
+        self.wake = wake  # called from the reader thread after each message, so the controller need not poll
         self.messages = queue.Queue()
+        self.ids = itertools.count(1)
         self.closed = False
         self.shutdown_deadline = None
         self.shutdown_timer = None
@@ -77,8 +79,10 @@ class NativeClient:
             for line in self.process.stdout:
                 try: self.messages.put(json.loads(line))
                 except ValueError: self.log.write(line.encode("utf-8", errors="replace"))
+                else: self.wake()
         finally:
             self.messages.put({"disconnected": True})
+            self.wake()
 
     def dispatch(self, message):
         if message.get("disconnected"):
@@ -91,7 +95,7 @@ class NativeClient:
     def call(self, method, **args):
         if self.closed or self.process.poll() is not None:
             raise ConnectionError("Native recorder is not running. Start the engine again.")
-        ident = uuid.uuid4().hex
+        ident = next(self.ids)
         self.process.stdin.write(json.dumps({"id": ident, "method": method, "args": args}) + "\n")
         self.process.stdin.flush()
         deadline = time.monotonic() + (75 if method == "Shutdown" else 45 if method == "Initialize" else 30)

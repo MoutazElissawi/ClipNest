@@ -11,6 +11,29 @@ import psutil
 import time
 from collections import deque
 
+from .fullscreen import user32
+
+# A saved clip is named <game>_<day-month-year>_<hours-minutes-seconds>_<number>.
+# Clips saved before 2.2.4 put the year first, and are read the same way.
+CLIP_STAMP = "%d-%m-%Y_%H-%M-%S_%f"
+CLIP_NAME = re.compile(r'(?P<game>.+?)_(?:(?P<year>\d{4})-(?P<month>\d\d)-(?P<day>\d\d)|(?P<day2>\d\d)-(?P<month2>\d\d)-(?P<year2>\d{4}))'
+                       r'_(?P<hour>\d\d)-(?P<minute>\d\d)-(?P<second>\d\d)(?:_(?P<number>\d+))?')
+
+
+def parse_clip_name(name):
+    """(game, time saved, number) from a ClipNest clip name, or None for any other name. number may be ''."""
+    match = CLIP_NAME.match(Path(name).stem)
+    if not match:
+        return None
+    part = match.groupdict()
+    try:
+        saved = datetime(int(part['year'] or part['year2']), int(part['month'] or part['month2']), int(part['day'] or part['day2']),
+                         int(part['hour']), int(part['minute']), int(part['second']))
+    except ValueError:
+        return None
+    return part['game'], saved, part['number'] or ''
+
+
 KNOWN_GAMES = {"valorant-win64-shipping.exe": "Valorant", "valorant.exe": "Valorant",
                "osu!.exe": "osu!", "helldivers2.exe": "Helldivers 2", "rocketleague.exe": "Rocket League",
                "marvel-win64-shipping.exe": "Marvel Rivals", "chivalry2-win64-shipping.exe": "Chivalry 2",
@@ -57,7 +80,7 @@ def archive_file(source, output, category, kind):
         if len(aliases) == 1:
             folder = aliases[0]
     folder.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+    stamp = datetime.now().strftime(CLIP_STAMP)
     target = folder / f"{safe_folder(category)}_{stamp}{source.suffix}"
     # Same-volume move, never replace an existing clip.
     while target.exists():
@@ -66,14 +89,13 @@ def archive_file(source, output, category, kind):
     return target
 
 
+_processes = {}  # (hwnd, pid) -> (name, exe): a window keeps its process, so focus polling skips the lookups
+
+
 def foreground():
     if os.name != "nt":
         return None
-    user = ctypes.windll.user32
-    user.GetForegroundWindow.restype = wintypes.HWND
-    user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-    user.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-    user.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user = user32()
     hwnd = user.GetForegroundWindow()
     title = ctypes.create_unicode_buffer(min(4096, max(1, user.GetWindowTextLengthW(hwnd)+1)))
     user.GetWindowTextW(hwnd, title, len(title))
@@ -82,23 +104,34 @@ def foreground():
     if not pid.value and not title.value:
         return None
     result = {"pid": pid.value or None, "exe": "", "name": "", "title": title.value, "hwnd": int(hwnd or 0)}
+    if not pid.value:
+        return result
+    key = (result["hwnd"], pid.value)
+    if key not in _processes:
+        if len(_processes) > 64:
+            _processes.clear()
+        _processes[key] = process_names(pid.value)
+    result["name"], result["exe"] = _processes[key]
+    return result
+
+
+def process_names(pid):
+    """(name, exe) of a process. Elevated/protected games may expose their name but deny the full path."""
+    name = exe = ''
     try:
-        if not pid.value:
-            return result
-        process = psutil.Process(pid.value)
-        # Elevated/protected games may expose their name but deny the full path.
-        for key, getter in (("name", process.name), ("exe", process.exe)):
-            try:
-                result[key] = getter()
-            except (psutil.Error, OSError):
-                pass
+        process = psutil.Process(pid)
+        try:
+            name = process.name()
+        except (psutil.Error, OSError):
+            pass
+        try:
+            exe = process.exe()
+        except (psutil.Error, OSError):
+            pass
     except (psutil.Error, OSError):
         pass
-    if not result['exe']:
-        result['exe'] = limited_process_path(pid.value)
-    if not result['name'] and result['exe']:
-        result['name'] = result['exe'].replace('\\', '/').rsplit('/', 1)[-1]
-    return result
+    exe = exe or limited_process_path(pid)
+    return name or exe.replace('\\', '/').rsplit('/', 1)[-1], exe
 
 
 def limited_process_path(pid):

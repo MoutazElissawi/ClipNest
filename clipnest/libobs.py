@@ -42,7 +42,6 @@ SIGNATURES = {
     "obs_source_update": (None, P, P), "obs_source_set_muted": (None, P, B),
     "obs_source_get_width": (U, P), "obs_source_get_height": (U, P),
     "obs_source_set_volume": (None, P, F), "obs_source_set_audio_mixers": (None, P, U),
-    "obs_source_set_monitoring_type": (None, P, I),
     "obs_get_source_properties": (P, S),
     "obs_source_properties": (P, P), "obs_properties_destroy": (None, P),
     "obs_properties_get": (P, P, S), "obs_property_list_format": (I, P),
@@ -70,7 +69,7 @@ SIGNATURES = {
     "calldata_get_string": (B, P, S, C.POINTER(S)),
     "calldata_get_data": (B, P, S, P, Z), "bfree": (None, P),
     "obs_volmeter_create": (P, I), "obs_volmeter_destroy": (None, P),
-    "obs_volmeter_attach_source": (B, P, P),
+    "obs_volmeter_attach_source": (B, P, P), "obs_volmeter_detach_source": (None, P),
     "obs_volmeter_add_callback": (None, P, METER, P),
     "obs_volmeter_remove_callback": (None, P, METER, P),
 }

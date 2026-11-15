@@ -42,7 +42,7 @@ class Toast(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setOpacity(self.reveal)
         p.translate(self.slide_direction * (1.0-self.reveal) * self.width(), 0)
-        accent = QColor('#ff8e9f' if self.tone == 'error' else '#a4d65e')
+        accent = QColor('#e5484d' if self.tone == 'error' else '#5fb33a')
         p.setBrush(QColor(20, 20, 20, 247))
         p.setPen(QPen(QColor('#4a4a4a'), 1))
         p.drawRoundedRect(QRectF(1, 1, self.width()-2, self.height()-2), 12, 12)
@@ -135,20 +135,13 @@ class Notifications:
         if chosen:
             return chosen
         if os.name == 'nt':
+            from .fullscreen import MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, user32
             try:
-                api = ctypes.windll.user32
-                api.GetForegroundWindow.restype = wintypes.HWND
-                api.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
-                api.MonitorFromWindow.restype = wintypes.HANDLE
-                class MonitorInfo(ctypes.Structure):
-                    _fields_ = [('size', wintypes.DWORD), ('monitor', wintypes.RECT),
-                                ('work', wintypes.RECT), ('flags', wintypes.DWORD), ('device', wintypes.WCHAR*32)]
-                info = MonitorInfo()
-                info.size = ctypes.sizeof(info)
-                api.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MonitorInfo)]
-                handle = api.MonitorFromWindow(api.GetForegroundWindow(), 2)
+                api = user32()
+                info = MONITORINFOEXW(cbSize=ctypes.sizeof(MONITORINFOEXW))
+                handle = api.MonitorFromWindow(api.GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
                 if api.GetMonitorInfoW(handle, ctypes.byref(info)):
-                    chosen = next((screen for screen in screens if screen.name().casefold() == info.device.casefold()), None)
+                    chosen = next((screen for screen in screens if screen.name().casefold() == info.szDevice.casefold()), None)
             except (AttributeError, OSError):
                 pass
         return chosen or QApplication.primaryScreen()

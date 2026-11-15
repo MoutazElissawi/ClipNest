@@ -5,11 +5,9 @@ from datetime import datetime
 from PySide6.QtCore import Qt, QThread, Signal, QSize
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QLineEdit, QComboBox, QListWidget, QListWidgetItem, QFileDialog, QCheckBox, QInputDialog, QMessageBox)
+    QLineEdit, QComboBox, QListWidget, QListWidgetItem, QFileDialog, QCheckBox)
 from .editor_assets import scan_clips, thumbnail
-
-
-from .desktop import SmoothList
+from .desktop import ClipActions, SmoothList
 from .library import Annotations, matches
 
 
@@ -44,7 +42,7 @@ class Thumbnails(QThread):
                 continue
 
 
-class ClipBrowser(QDialog):
+class ClipBrowser(ClipActions, QDialog):
     def __init__(self, root, ffmpeg, cache, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Browse clips')
@@ -179,44 +177,10 @@ class ClipBrowser(QDialog):
             self.workers.append(worker)
             worker.start()
 
-    def selected_paths(self):
-        return [item.data(Qt.ItemDataRole.UserRole) for item in self.list.selectedItems()]
+    def show_clips(self):
+        self.populate()
 
-    def favorite_selected(self):
-        self.edit_annotations(favorite=True)
-
-    def tag_selected(self):
-        self.edit_annotations(favorite=False)
-
-    def edit_annotations(self, favorite):
-        paths = self.selected_paths()
-        selected = [c for c in self.clips if c['path'] in paths]
-        if not selected:
-            return
-        if favorite:
-            values = dict(favorite=not all(c.get('favorite', False) for c in selected))
-        else:
-            text, ok = QInputDialog.getText(self, 'Tags', 'Comma-separated tags (replaces selected tags):', text=', '.join(selected[0].get('tags', [])))
-            if not ok:
-                return
-            values = dict(tags=[t.strip() for t in text.split(',') if t.strip()])
-        try:
-            for clip in selected:
-                self.annotations.set(clip['path'], **values)
-                clip.update(values)
-            self.populate()
-        except Exception as exc:
-            QMessageBox.warning(self, 'Clip annotations', str(exc))
-
-    def combine_selected(self):
-        from .join_dialog import JoinDialog
-        paths = self.selected_paths()
-        if len(paths) < 2:
-            QMessageBox.information(self, 'Combine clips', 'Ctrl-click two or more clips first.')
-            return
-        dialog = JoinDialog(paths, self)
-        dialog.exec()
-        dialog.deleteLater()
+    def reload_clips(self):
         self.scan()
 
     def thumbnail_ready(self, path, image):

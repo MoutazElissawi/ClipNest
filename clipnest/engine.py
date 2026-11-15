@@ -5,12 +5,13 @@ import json
 import logging
 from pathlib import Path
 import queue
+import threading
 import time
 
 from PySide6.QtCore import QThread, Signal
 
 from .catalog import Catalog, archive_file, foreground
-from .config import DATA, ENGINE, SETTINGS, atomic_json, validate
+from .config import DATA, ENGINE, GAME_TRACK, SETTINGS, atomic_json, track_layout, validate
 from . import fullscreen
 from .native_client import NativeClient, NativeError as ObsError
 
@@ -18,6 +19,7 @@ log = logging.getLogger("clipnest")
 SCENE, SCREEN, DESKTOP, MIC = "Capture", "CN Screen", "CN Desktop", "CN Microphone"
 APP_AUDIO = "CN App Audio"
 GAME_AUDIO = "CN Game Audio"
+APP_TRACK = "CN App Track {}"  # one per chosen app in the "one track per app" layout
 GAME_LAYER = "CN Game Layer"
 
 
@@ -38,10 +40,21 @@ GAME_CAPTURE_SETTINGS = {"capture_mode": "window", "window": "", "priority": 2, 
 # Settings the GUI uses on its own; changing only these never restarts capture.
 LIVE_SETTINGS = {"replay_key", "record_key", "ptt_key", "mic_mode", "mic_volume", "notifications_enabled",
                  "notification_corner", "notification_seconds", "notification_screen", "ui_theme", "glass_tint",
-                 "theme_file", "storage_limit_gb", "export_sound", "games"}
+                 "theme_file", "storage_limit_gb", "export_sound", "games",
+                 "launch_at_login", "auto_replay", "close_to_tray"}
 # SystemEvents' reason for WM_DISPLAYCHANGE, which fullscreen games cause on Alt-Tab.
 DISPLAY_CHANGED = "Display configuration changed"
+AUTO_START_RETRY_SECONDS = 5
+AUTO_START_RETRIES = 6  # about half a minute for devices to appear after sign-in
 JOURNAL = DATA / "pending.json"
+POLL_SECONDS = .8  # recorder status
+FOCUS_SECONDS = .2  # the focused game, for the game layer and Games only
+WAKE = "wake"  # queued by the recorder's reader and the replay worker when something arrives
+
+
+def track_flags(tracks):
+    """OBS's per-track switches for a source recording to `tracks` (1-6)."""
+    return {str(i): i in tracks for i in range(1, 7)}
 
 
 class Engine(QThread):
@@ -77,6 +90,7 @@ class Engine(QThread):
         self.muted = None
         self.meter_levels = {}
         self.last_meter = 0
+        self.meters_shown = False  # the window shows the meters; the recorder only measures then
         self.last_poll = 0
         self.continuous = None
         self.replay_started = None
@@ -94,8 +108,11 @@ class Engine(QThread):
         self.stitch = None
         self.layer_rects = {}
         self.layer_placed = None
+        self.layer_hooked = False  # OBS hooks while the layer's scene item is visible
+        self.layer_hwnd = None  # the hiding window the hook is for
         self.game_visible = None  # None outside Games only
         self.game_audio = False  # Games only option: the game's audio replaces system output
+        self.game_track = False  # the game's audio also gets its own track (Games only option, or One track per app)
         self.game_target = None
         self.game_key = None
         self.focused = (None, None)
@@ -112,6 +129,20 @@ class Engine(QThread):
             self.begin_shutdown()
         if not self.shutting_down or command == "shutdown":
             self.commands.put((command, data))
+
+    def wake(self):
+        self.commands.put((WAKE, None))
+
+    def next_wait(self):
+        """Seconds until the next periodic check, or None to sleep until a command or a wake."""
+        if not self.rpc:
+            return None
+        due = [self.last_poll + POLL_SECONDS]
+        if self.game_layer_on is not None or self.game_visible is not None or self.game_track:
+            due.append(self.last_layer_check + FOCUS_SECONDS)
+        if self.archive_retry:
+            due.append(self.next_retry)
+        return max(0, min(due) - time.monotonic() + .005)  # Windows timeouts can end a little early
 
     def begin_shutdown(self):
         self.shutting_down = True
@@ -181,10 +212,10 @@ class Engine(QThread):
                     self.shutdown_failed(exc)
                 continue
             try:
-                command, data = self.commands.get(timeout=.025)
+                command, data = self.commands.get(timeout=self.next_wait())
             except queue.Empty:
                 command = None
-            if command:
+            if command and command != WAKE:
                 try:
                     self.handle(command, data)
                 except Exception as exc:
@@ -201,14 +232,14 @@ class Engine(QThread):
                 try:
                     self.rpc.pump()
                     now = time.monotonic()
-                    if now - self.last_poll > .8:
+                    if now - self.last_poll >= POLL_SECONDS:
                         self.poll()
                         self.last_poll = now
-                    if now - self.last_layer_check > .2:
+                    if now - self.last_layer_check >= FOCUS_SECONDS:
                         self.last_layer_check = now
                         self.update_game_layer()
                         self.update_game_capture()
-                    if self.archive_retry and now > self.next_retry:
+                    if self.archive_retry and now >= self.next_retry:
                         jobs, self.archive_retry = self.archive_retry, []
                         for path, ctx, kind, attempts in jobs:
                             self.finish_file(path, ctx, kind, attempts)
@@ -223,15 +254,18 @@ class Engine(QThread):
                         self.announced_active = {'record': False, 'replay': False}
                     else:
                         self.notify('Recorder disconnected', 'The recorder connection was lost. Check recorder logs.', 'error')
-                    old = self.rpc
-                    self.rpc = None
-                    try:
-                        old.disconnect()
-                    except Exception as cleanup_error:
-                        self.retiring_clients.append(old)
-                        self.error.emit(str(cleanup_error))
-                    self.state.emit({"connected": False})
+                    self.drop_client()
                     self.error.emit(f"Native recorder connection lost: {exc}. Check _Unsorted for completed files and native-engine.log for details.")
+
+    def drop_client(self):
+        """Disconnect a failed recorder; one that will not exit stays tracked until shutdown."""
+        old, self.rpc = self.rpc, None
+        try:
+            old.disconnect()
+        except Exception as cleanup_error:
+            self.retiring_clients.append(old)
+            self.error.emit(str(cleanup_error))
+        self.state.emit({"connected": False})
 
     def drain_continuous(self):
         if self.continuous is None:
@@ -261,7 +295,8 @@ class Engine(QThread):
         except (OSError, ValueError):
             prefs = {}
         ffmpeg, ffprobe = tools_path(prefs.get("ffmpeg_folder", ""))
-        self.continuous = ContinuousReplay(ffmpeg, ffprobe, Path(self.settings["output"])/"_Unsorted", self.settings["replay_seconds"])
+        self.continuous = ContinuousReplay(ffmpeg, ffprobe, Path(self.settings["output"])/"_Unsorted",
+                                           self.settings["replay_seconds"], wake=self.wake)
 
     def call(self, method, **args):
         if not self.rpc:
@@ -305,7 +340,11 @@ class Engine(QThread):
     def setup_game_capture(self):
         """Games only: start black and keep the last game, so a reconnect keeps following it."""
         if self.settings.get("capture_target") != "games":
-            self.game_visible = self.game_target = self.game_key = None
+            self.game_visible = self.game_key = None
+            if self.game_track and self.game_target:
+                self.target_game(self.game_target)  # the rebuilt Game track keeps the last game
+            else:
+                self.game_target = None
             return
         self.game_visible, self.game_key, self.focused = False, None, (None, None)
         self.call("SetInputEnabled", inputName=SCREEN, inputEnabled=False)
@@ -319,18 +358,21 @@ class Engine(QThread):
         if key == self.game_key:
             return
         window = {"window": target["window"], "priority": 2 if target["exe"] else 0}
-        self.call("SetInputSettings", inputName=SCREEN, inputSettings=window)
-        if self.game_audio:
+        if self.game_visible is not None:  # Games only video; other capture modes follow the game for audio only
+            self.call("SetInputSettings", inputName=SCREEN, inputSettings=window)
+        if self.game_audio or self.game_track:
             self.call("SetInputSettings", inputName=GAME_AUDIO, inputSettings=window)
         self.game_key = key
-        log.info("Games only: following %r (exe=%r class=%r)", target["app"]["category"], target["exe"], target["class"])
+        log.info("%s %r (exe=%r class=%r)", "Games only: following" if self.game_visible is not None else "Game track: following",
+                 target["app"]["category"], target["exe"], target["class"])
 
     def update_game_capture(self):
         """Follow the focused game. Other apps never replace it: an unfocused game keeps
         showing its own frames (frozen if it stops drawing), a minimized one is black.
-        Nothing here stops or restarts an output.
+        Nothing here stops or restarts an output. Outside Games only, the Game track
+        follows the focused game the same way, without touching the video.
         """
-        if self.game_visible is None:
+        if self.game_visible is None and not self.game_track:
             return
         window = fullscreen.foreground_window()
         if window:
@@ -345,7 +387,9 @@ class Engine(QThread):
                 self.target_game(dict(hwnd=hwnd, exe=exe, **{"class": window.get("class", "")},
                                       window=fullscreen.window_spec(app.get("title", ""), window.get("class", ""), exe),
                                       app=dict(app, category=category)))
-        shown = bool(self.game_target) and fullscreen.window_shown(self.game_target["hwnd"])
+        if self.game_visible is None:
+            return
+        shown =bool(self.game_target) and fullscreen.window_shown(self.game_target["hwnd"])
         if shown != self.game_visible:
             self.call("SetInputEnabled", inputName=SCREEN, inputEnabled=shown)
             self.game_visible = shown
@@ -359,9 +403,12 @@ class Engine(QThread):
             return None
 
     def update_game_layer(self):
-        """Draw the hooked game only while that game is the focused fullscreen window on the captured monitor.
+        """Hook only games that hide from display capture, and draw the hooked game only while
+        it is the focused fullscreen window on the captured monitor.
 
-        The hook stays attached while the layer is not drawn, so returning from Alt-Tab is immediate.
+        Every other game is already in the display capture, and closing a DirectX 12 game with
+        the hook inside it hung the GPU. The hook stays attached while the layer is not drawn,
+        so returning from Alt-Tab is immediate.
         """
         if self.game_layer_on is None:
             return
@@ -369,16 +416,23 @@ class Engine(QThread):
         self.last_layer_window = window
         draw = False
         if fullscreen.layer_wanted(window, self.game_layer_device):
-            hook = self.game_layer_state() or {}
-            if hook.get('hooked') and not fullscreen.same_window_app(window, hook):
-                # OBS keeps its first hook in "any fullscreen" mode; re-hook the focused game.
-                if time.monotonic() - self.last_layer_reset > 3:
-                    self.last_layer_reset = time.monotonic()
-                    log.info("Game layer re-hooking: hooked %r, focused class=%r", hook.get('executable'), window.get('class'))
-                    self.call("SetSceneItemEnabled", sceneName=SCENE, sceneItemId=GAME_LAYER, sceneItemEnabled=False)
-                    self.call("SetSceneItemEnabled", sceneName=SCENE, sceneItemId=GAME_LAYER, sceneItemEnabled=True)
+            if fullscreen.hides_from_capture(window) or (self.layer_hwnd and window.get('hwnd') == self.layer_hwnd):
+                self.layer_hwnd = window.get('hwnd')  # keeps its hook if it stops hiding
+                self.hook_game_layer(True, window)
+                hook = self.game_layer_state() or {}
+                if hook.get('hooked') and not fullscreen.same_window_app(window, hook):
+                    # OBS keeps its first hook in "any fullscreen" mode; re-hook the focused game.
+                    if time.monotonic() - self.last_layer_reset > 3:
+                        self.last_layer_reset = time.monotonic()
+                        log.info("Game layer re-hooking: hooked %r, focused class=%r", hook.get('executable'), window.get('class'))
+                        self.call("SetSceneItemEnabled", sceneName=SCENE, sceneItemId=GAME_LAYER, sceneItemEnabled=False)
+                        self.call("SetSceneItemEnabled", sceneName=SCENE, sceneItemId=GAME_LAYER, sceneItemEnabled=True)
+                else:
+                    draw = bool(hook.get('hooked')) and (hook.get('size') or [0])[0] > 0
             else:
-                draw = bool(hook.get('hooked')) and (hook.get('size') or [0])[0] > 0
+                self.hook_game_layer(False, window)
+        elif self.layer_hooked and not (self.game_layer_state() or {}).get('hooked'):
+            self.hook_game_layer(False, window)  # the hooked game closed while another window had focus
         if draw and self.layer_rects:
             device = (window.get('device') or '').casefold()
             if device in self.layer_rects and device != self.layer_placed:
@@ -393,6 +447,17 @@ class Engine(QThread):
         log.info("Game layer %s (foreground class=%r monitor=%r affinity=%s)", "drawn" if draw else "not drawn",
                  (window or {}).get('class'), (window or {}).get('device'), (window or {}).get('affinity'))
 
+    def hook_game_layer(self, on, window):
+        """OBS hooks the focused fullscreen game while the layer's scene item is visible."""
+        if on == self.layer_hooked:
+            return
+        self.call("SetSceneItemEnabled", sceneName=SCENE, sceneItemId=GAME_LAYER, sceneItemEnabled=on)
+        self.layer_hooked = on
+        if not on:
+            self.layer_hwnd = None
+        log.info("Game layer hook %s (foreground class=%r affinity=%s)", "on" if on else "released",
+                 (window or {}).get('class'), (window or {}).get('affinity'))
+
     def connect_engine(self):
         if self.rpc:
             return
@@ -403,14 +468,13 @@ class Engine(QThread):
             raise RuntimeError("Recorder libraries are missing. Close ClipNest and run Start_ClipNest.bat.")
         self.message.emit("Starting ClipNest's native recording engine...")
         self.stitch = self.stitch_layout()
-        self.rpc = NativeClient(self.host_settings(), self.on_event)
+        self.rpc = NativeClient(self.host_settings(), self.on_event, wake=self.wake)
         try:
             self.recording = self.replay = False
             self.setup_sources()
             self.read_devices()
-            self.muted = None
-            self.set_mic(self.settings["mic_mode"] != "Always on")
             self.call("SetInputVolume", inputName=MIC, inputVolumeMul=self.settings["mic_volume"] / 100)
+            self.call("SetMetersShown", shown=self.meters_shown)
             if self.pending_replay or self.record_context:
                 self.message.emit("An earlier session ended before sorting completed. Check _Unsorted for its files.")
             self.pending_replay = self.record_context = None
@@ -418,14 +482,7 @@ class Engine(QThread):
             self.message.emit(f"Native engine ready with {self.settings['encoder']}. Start replay when you want to begin buffering.")
             self.poll()
         except Exception:
-            old = self.rpc
-            self.rpc = None
-            try:
-                old.disconnect()
-            except Exception as cleanup_error:
-                self.retiring_clients.append(old)
-                self.error.emit(str(cleanup_error))
-            self.state.emit({"connected": False})
+            self.drop_client()
             raise
 
     def setup_sources(self):
@@ -453,7 +510,7 @@ class Engine(QThread):
                 if not kind:
                     raise RuntimeError(f"The native engine is missing its Windows capture component: {prefix}")
                 self.call("CreateInput", sceneName=SCENE, inputName=name, inputKind=kind,
-                          inputSettings=settings, sceneItemEnabled=True)
+                          inputSettings=settings, sceneItemEnabled=True, meter=name != SCREEN)
             elif name != SCREEN:
                 self.call("SetInputSettings", inputName=name, inputSettings=settings)
         if not window_capture:
@@ -472,18 +529,15 @@ class Engine(QThread):
             self.capture_monitor = (monitor_property, selected)
             self.call("SetInputSettings", inputName=SCREEN,
                       inputSettings={monitor_property: selected, "force_sdr": True, "method": self.settings.get("capture_method", 2)})
-        # Silence default global sources to prevent duplicated desktop/mic audio.
-        for name in self.call("GetSpecialInputs").values():
-            if name and name not in (MIC, DESKTOP):
-                self.call("SetInputMute", inputName=name, inputMuted=True)
-                self.call("SetInputAudioTracks", inputName=name, inputAudioTracks={str(i): False for i in range(1, 7)})
-        for name, tracks in [(DESKTOP, (1, 2)), (MIC, (1, 3))]:
-            self.call("SetInputAudioTracks", inputName=name, inputAudioTracks={str(i): i in tracks for i in range(1, 7)})
-            self.call("SetInputAudioMonitorType", inputName=name, monitorType="OBS_MONITORING_TYPE_NONE")
-        self.call("SetInputMute", inputName=DESKTOP, inputMuted=False)
-        self.call("SetInputVolume", inputName=DESKTOP, inputVolumeMul=1.0)
-        self.setup_app_audio(kinds)
-        self.setup_game_audio(kinds)
+        routes, apps = self.audio_routes()
+        for name in (DESKTOP, MIC):
+            self.call("SetInputAudioTracks", inputName=name, inputAudioTracks=track_flags(routes[name]))
+        self.call("SetInputMute", inputName=DESKTOP, inputMuted=not routes[DESKTOP])
+        if track_layout(self.settings) is None:
+            self.setup_app_audio(kinds)
+            self.setup_game_audio(kinds)
+        else:
+            self.setup_app_tracks(kinds, routes[GAME_AUDIO], apps)
         self.muted = None
         self.set_mic(self.settings["mic_mode"] != "Always on")
         item = self.call("GetSceneItemId", sceneName=SCENE, sourceName=SCREEN)["sceneItemId"]
@@ -535,6 +589,43 @@ class Engine(QThread):
             self.call("SetSceneItemTransform", sceneName=SCENE, sceneItemId=name,
                       sceneItemTransform=placement(x, y, w, h))
 
+    def audio_routes(self):
+        """OBS tracks (1-6) the Desktop, Microphone and game sources record to, and the
+        (track, window) of each chosen app in the "one track per app" layout."""
+        layout = track_layout(self.settings)
+        if layout is None:
+            return {DESKTOP: (1, 2), MIC: (1, 3), GAME_AUDIO: ()}, []
+        def tracks(*kinds):
+            return tuple(i for i, (_, kind, _) in enumerate(layout, 1) if kind in kinds)
+        apps = [(i, window) for i, (_, kind, window) in enumerate(layout, 1) if kind == "app"]
+        return {DESKTOP: tracks("mix", "desktop"), MIC: tracks("mix", "mic"), GAME_AUDIO: tracks("game")}, apps
+
+    def setup_app_tracks(self, kinds, game_tracks, apps):
+        """"One track per app": the game and each chosen app record on their own tracks
+        (Windows 10 2004+). Mix and Desktop, when chosen, still contain every app, because
+        system output capture cannot exclude a process.
+        """
+        self.game_audio = self.game_track = False
+        if not (game_tracks or apps):
+            return
+        kind = input_kind(kinds, "wasapi_process_output_capture")
+        if not kind:
+            self.message.emit("Separate app tracks need Windows 10 version 2004 or newer. Those tracks stay silent.")
+            return
+        sources = [(APP_TRACK.format(track), window, (track,)) for track, window in apps]
+        if game_tracks:
+            sources.append((GAME_AUDIO, "", game_tracks))  # target_game points it at the focused game
+            self.game_track = True
+        for name, window, tracks in sources:
+            self.add_process_audio(name, kind, window, tracks)
+
+    def add_process_audio(self, name, kind, window, tracks, meter=False):
+        """One application's (or the followed game's) audio, recorded only on `tracks`."""
+        self.call("CreateInput", sceneName=SCENE, inputName=name, inputKind=kind,
+                  inputSettings={"window": window, "priority": 2}, sceneItemEnabled=True, meter=meter)
+        self.call("SetInputAudioTracks", inputName=name, inputAudioTracks=track_flags(tracks))
+        self.call("SetInputMute", inputName=name, inputMuted=False)
+
     def setup_app_audio(self, kinds):
         """Optional fourth track with one application's audio (Windows 10 2004+).
 
@@ -548,38 +639,43 @@ class Engine(QThread):
             self.message.emit("Application audio capture needs Windows 10 version 2004 or newer. Recording continues with three tracks.")
             self.settings["app_audio"] = ""
             return
-        self.call("CreateInput", sceneName=SCENE, inputName=APP_AUDIO, inputKind=kind,
-                  inputSettings={"window": self.settings["app_audio"], "priority": 2}, sceneItemEnabled=True)
-        self.call("SetInputAudioTracks", inputName=APP_AUDIO, inputAudioTracks={str(i): i == 4 for i in range(1, 7)})
-        self.call("SetInputAudioMonitorType", inputName=APP_AUDIO, monitorType="OBS_MONITORING_TYPE_NONE")
-        self.call("SetInputMute", inputName=APP_AUDIO, inputMuted=False)
-        self.call("SetInputVolume", inputName=APP_AUDIO, inputVolumeMul=1.0)
+        self.add_process_audio(APP_AUDIO, kind, self.settings["app_audio"], (4,))
 
     def setup_game_audio(self, kinds):
-        """Games only option (off by default): Mix and Desktop carry the followed game's
-        audio instead of the whole system output, so browsers, music and calls stay out.
+        """Games only options (both off by default).
+
+        game_audio_only: Mix and Desktop carry the followed game's audio instead of the
+        whole system output, so browsers, music and calls stay out.
+        game_audio_track: Mix and Desktop still record everything; the game alone goes on
+        track 5, so the editor can leave music out later. System output capture cannot
+        exclude a process, so Desktop still contains the game too.
         """
-        self.game_audio = False
-        if self.settings.get("capture_target") != "games" or not self.settings.get("game_audio_only"):
+        self.game_audio = self.game_track = False
+        only, separate = self.settings.get("game_audio_only"), self.settings.get("game_audio_track")
+        if self.settings.get("capture_target") != "games" or not (only or separate):
             return
         kind = input_kind(kinds, "wasapi_process_output_capture")
         if not kind:
-            self.message.emit("Game-only audio needs Windows 10 version 2004 or newer. Recording the whole system audio instead.")
+            self.message.emit("Game-only audio needs Windows 10 version 2004 or newer. Recording the whole system audio instead."
+                              if only else "A separate game audio track needs Windows 10 version 2004 or newer. Recording without it.")
             return
-        self.call("CreateInput", sceneName=SCENE, inputName=GAME_AUDIO, inputKind=kind,
-                  inputSettings={"window": "", "priority": 2}, sceneItemEnabled=True)
-        self.call("SetInputAudioTracks", inputName=GAME_AUDIO, inputAudioTracks={str(i): i in (1, 2) for i in range(1, 7)})
-        self.call("SetInputAudioMonitorType", inputName=GAME_AUDIO, monitorType="OBS_MONITORING_TYPE_NONE")
-        self.call("SetInputMute", inputName=GAME_AUDIO, inputMuted=False)
-        self.call("SetInputVolume", inputName=GAME_AUDIO, inputVolumeMul=1.0)
+        # With game-only audio the Desktop meter shows the game, so only then is it measured.
+        self.add_process_audio(GAME_AUDIO, kind, "", (1, 2) if only else (GAME_TRACK,), meter=not separate)
+        if separate:
+            self.game_track = True
+            return
         # The system output source stays for device lists and reconnects but records nothing.
-        self.call("SetInputAudioTracks", inputName=DESKTOP, inputAudioTracks={str(i): False for i in range(1, 7)})
+        self.call("SetInputAudioTracks", inputName=DESKTOP, inputAudioTracks=track_flags(()))
         self.call("SetInputMute", inputName=DESKTOP, inputMuted=True)
         self.game_audio = True
 
     def setup_game_layer(self, kinds):
-        """Hook fullscreen games above display capture; the display source stays as configured."""
+        """Game capture above display capture for games that hide from it; the display source stays as configured.
+
+        The scene item starts hidden, so nothing is hooked until such a game has focus.
+        """
         self.game_layer_on = None
+        self.layer_hooked, self.layer_hwnd = False, None
         if self.settings.get("capture_target", "display") not in ("display", "displays") or not self.settings.get("game_layer", True):
             return
         kind = input_kind(kinds, "game_capture")
@@ -587,7 +683,7 @@ class Engine(QThread):
             log.warning("Game layer unavailable: the native engine has no game_capture source")
             return
         self.call("CreateInput", sceneName=SCENE, inputName=GAME_LAYER, inputKind=kind,
-                  inputSettings=dict(GAME_LAYER_SETTINGS), sceneItemEnabled=True)
+                  inputSettings=dict(GAME_LAYER_SETTINGS), sceneItemEnabled=False)
         self.call("SetInputEnabled", inputName=GAME_LAYER, inputEnabled=False)
         self.call("SetSceneItemTransform", sceneName=SCENE, sceneItemId=GAME_LAYER,
                   sceneItemTransform=placement(0, 0, self.settings["width"], self.settings["height"]))
@@ -638,9 +734,9 @@ class Engine(QThread):
             self.muted = muted
 
     def poll(self):
-        rec = self.call("GetRecordStatus")
+        rec = self.call("GetRecordStatus")  # includes the replay buffer's state: one round trip per poll
         self.recording = rec["outputActive"]
-        self.replay = self.call("GetReplayBufferStatus")["outputActive"]
+        self.replay = rec["replayActive"]
         for kind, active in (('record', self.recording), ('replay', self.replay)):
             previous = self.announced_active[kind]
             if active and not previous:
@@ -681,7 +777,7 @@ class Engine(QThread):
                          "saving": self.pending_replay is not None, "muted": self.muted, "stats": rec.get("stats", {}),
                          "game_layer": bool(self.game_layer_on),
                          "game": (self.game_target or {}).get("app", {}).get("category"), "game_visible": bool(self.game_visible),
-                         "game_audio": self.game_audio})
+                         "game_audio": self.game_audio, "game_track": self.game_track})
 
     def on_event(self, kind, data):
         if kind == "NativeNotice":
@@ -831,6 +927,29 @@ class Engine(QThread):
             self.handle('toggle_record', None)
         self.notify('Capture recovered', 'A fresh session started. Footage across sleep/lock/display changes is not continuous.' if any(intent.values()) else 'Recorder devices reconnected.')
 
+    def auto_start(self, retries):
+        """Start the engine and replay when ClipNest opens. Right after Windows sign-in the
+        audio and display devices can still be missing, so a failed start retries."""
+        try:
+            self.connect_engine()
+        except Exception:
+            if not retries or self.shutting_down:
+                raise
+            log.exception("Automatic engine start failed; %s retries left", retries)
+            self.message.emit(f"Recorder not ready yet. Trying again in {AUTO_START_RETRY_SECONDS} seconds.")
+            timer = threading.Timer(AUTO_START_RETRY_SECONDS, self.submit, ("auto_start", retries - 1))
+            timer.daemon = True
+            timer.start()
+            return
+        if not self.call("GetReplayBufferStatus")["outputActive"]:
+            self.handle("toggle_replay", None)
+
+    def save_settings(self, data):
+        atomic_json(SETTINGS, data)
+        self.settings = copy.deepcopy(data)
+        self.catalog.custom = self.settings["games"]
+        self.applied.emit(copy.deepcopy(self.settings))
+
     def needs_reconnect(self, data):
         """Only settings the native recorder uses need a fresh recorder (and stopped outputs)."""
         changed = {key for key in set(data) | set(self.settings) if data.get(key) != self.settings.get(key)}
@@ -846,7 +965,9 @@ class Engine(QThread):
         if self.rpc:
             sources = []
             unavailable = []
-            for key, name, mask in (('desktop_device', DESKTOP, 3), ('mic_device', MIC, 5)):
+            routes, _ = self.audio_routes()
+            for key, name in (('desktop_device', DESKTOP), ('mic_device', MIC)):
+                mask = sum(1 << (track - 1) for track in routes[name])
                 if key not in only:
                     continue
                 device = proposed[key]
@@ -858,7 +979,8 @@ class Engine(QThread):
                         raise ValueError(detail)
                     unavailable.append(detail)
                     continue
-                silent = name == DESKTOP and self.game_audio  # game-only audio keeps system output out
+                # Game-only audio, or a layout without Mix and Desktop, keeps system output out.
+                silent = name == DESKTOP and (self.game_audio or not mask)
                 sources.append(dict(inputName=name, device_id=device, mixers=0 if silent else mask,
                                     volume=self.settings['mic_volume']/100 if name == MIC else 1.0,
                                     muted=bool(self.muted) if name == MIC else silent))
@@ -908,6 +1030,8 @@ class Engine(QThread):
             return
         if command == "connect":
             self.connect_engine()
+        elif command == "auto_start":
+            self.auto_start(data)
         elif command == 'apply_audio':
             self.apply_audio_devices(data)
         elif command == 'audio_devices_changed':
@@ -976,35 +1100,27 @@ class Engine(QThread):
                     self.call("SetInputVolume", inputName=MIC, inputVolumeMul=volume / 100)
             if changed:
                 atomic_json(SETTINGS, self.settings)
-        elif command == "ui_theme":
-            theme = str(data.get("theme", "dark") if isinstance(data, dict) else data or "dark")
-            tint = int(data.get("tint", 46) if isinstance(data, dict) else self.settings.get("glass_tint", 46))
-            if not 25 <= tint <= 85:
-                raise ValueError("Glass tint must be between 25 and 85 percent.")
-            if theme not in ("dark", "glass"):
-                raise ValueError("Choose a supported appearance.")
-            self.settings.update(ui_theme=theme, glass_tint=tint)
-            atomic_json(SETTINGS, self.settings)
-            self.message.emit("Appearance saved as " + ("Frosted glass." if theme == "glass" else "Classic dark."))
+        elif command == "meters":
+            self.meters_shown = bool(data)
+            if self.rpc:
+                self.call("SetMetersShown", shown=self.meters_shown)
+            if not self.meters_shown:
+                self.meter_levels.clear()
+                self.meters.emit({})
         elif command == "apply":
             validate(data)
             if self.rpc and not self.needs_reconnect(data):
                 # Shortcuts, notifications and appearance apply live; capture keeps running.
-                atomic_json(SETTINGS, data)
-                self.settings = copy.deepcopy(data)
-                self.catalog.custom = self.settings["games"]
-                self.applied.emit(copy.deepcopy(self.settings))
+                self.save_settings(data)
                 self.message.emit("Settings saved.")
                 return
             if self.rpc:
-                if self.call("GetRecordStatus")["outputActive"] or self.call("GetReplayBufferStatus")["outputActive"]:
+                status = self.call("GetRecordStatus")
+                if status["outputActive"] or status["replayActive"]:
                     raise ValueError("Stop recording and replay before applying capture settings.")
             if self.pending_replay or self.archive_retry:
                 raise ValueError("Wait for the pending clip save before applying settings.")
-            atomic_json(SETTINGS, data)
-            self.settings = copy.deepcopy(data)
-            self.catalog.custom = self.settings["games"]
-            self.applied.emit(copy.deepcopy(self.settings))
+            self.save_settings(data)
             if self.rpc:
                 old = self.rpc
                 self.rpc = None

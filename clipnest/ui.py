@@ -7,17 +7,18 @@ import logging
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QAbstractNativeEventFilter, QUrl, QSize
+from PySide6.QtCore import Qt, QTimer, QAbstractNativeEventFilter, QUrl, QSize, Signal
 from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTabWidget, QGroupBox, QFormLayout, QLineEdit, QSpinBox, QComboBox,
     QSlider, QProgressBar, QPlainTextEdit, QFileDialog, QMessageBox, QInputDialog,
-    QSystemTrayIcon, QMenu, QScrollArea, QCheckBox, QLayout, QSizePolicy)
+    QSystemTrayIcon, QMenu, QScrollArea, QCheckBox, QLayout, QSizePolicy, QStackedWidget)
 
-from .config import DATA, ENCODERS, save_appearance as persist_appearance
+from .config import APP_PRESETS, DATA, ENCODERS, MAX_TRACKS, app_track_name, save_appearance as persist_appearance
 from . import __version__
-from .engine import Engine, MIC, DESKTOP
-from .hotkeys import Hotkeys, held, parse_hotkey
+from .engine import AUTO_START_RETRIES, Engine, MIC, DESKTOP
+from . import autostart
+from .hotkeys import Hotkeys, parse_hotkey
 from .shortcut_field import ShortcutField
 
 from .theme import apply_theme, normalize_theme
@@ -28,6 +29,14 @@ from .system_events import SystemEvents
 
 
 from .branding import app_icon as icon
+
+
+def muted(text=''):
+    """Secondary text that wraps, styled by the theme's #muted rule."""
+    label = QLabel(text)
+    label.setObjectName('muted')
+    label.setWordWrap(True)
+    return label
 
 
 class NativeHotkeys(QAbstractNativeEventFilter):
@@ -51,6 +60,9 @@ class NativeHotkeys(QAbstractNativeEventFilter):
 
 
 class Window(DesktopWindow):
+    shortcutPressed = Signal(str)  # from the extra-modifier watch thread; queued onto the GUI thread
+    pttChanged = Signal(bool)  # the push-to-talk key, from the same watch thread
+
     def __init__(self, settings, preview=False):
         super().__init__(theme=normalize_theme(settings.get('ui_theme', 'dark')))
         self.settings = copy.deepcopy(settings)
@@ -58,6 +70,7 @@ class Window(DesktopWindow):
         self.connected = self.recording = self.replay = False
         self.closing = False
         self.allow_close = False
+        self.quitting = False  # Exit was chosen, so the close is not just the window's X
         self.last_app = {}
         self.last_mic = None
         self.device_data = {}
@@ -77,7 +90,11 @@ class Window(DesktopWindow):
             logging.warning(self.palette_error)
         apply_theme(self, self.current_theme)
         self.engine = Engine(settings)
-        self.hotkeys = Hotkeys()
+        self.shortcutPressed.connect(self.submit)
+        self.pttChanged.connect(self.ptt_state)
+        self.hotkeys = Hotkeys(self.shortcutPressed.emit, self.pttChanged.emit)
+        self.ptt_down = False
+        self.meters_shown = False
         self.capturing_shortcut = False
         self.notifications = Notifications(self.settings)
         self.native_filter = NativeHotkeys(self.submit)
@@ -90,7 +107,7 @@ class Window(DesktopWindow):
         outer = QHBoxLayout(shell)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        rail = QWidget()
+        rail = self.rail = QWidget()
         rail.setObjectName('rail')
         rail.setFixedWidth(200)
         navigation = QVBoxLayout(rail)
@@ -105,14 +122,27 @@ class Window(DesktopWindow):
         navigation.addLayout(brand_row)
         navigation.addSpacing(24)
         self.nav_buttons = {}
-        for index, label in ((0, 'Capture'), (2, 'Clips && games'), (1, 'Settings')):
-            button = self.button(label, lambda checked=False, i=index: self.tabs.setCurrentIndex(i), 'nav')
-            button.setIcon(QIcon(str(Path(__file__).parent/'assets'/('ui-'+{0:'capture', 2:'clips', 1:'settings'}[index]+'.svg'))))
+        for index, label in ((0, 'Capture'), (2, 'Clips && games')):  # Settings is in the menu bar
+            button = self.button(label, lambda checked=False, i=index: self.show_page(i), 'nav')
+            button.setIcon(QIcon(str(Path(__file__).parent/'assets'/('ui-'+{0:'capture', 2:'clips'}[index]+'.svg'))))
             button.setIconSize(QSize(22, 22))
             button.setCheckable(True)
             self.nav_buttons[index] = button
             navigation.addWidget(button)
-        navigation.addSpacing(24)
+        from .game_gallery import GameRail
+        self.game_rail = GameRail(self.settings['output'])  # the Dial theme's game list
+        self.game_rail.chosen.connect(self.open_game)
+        self.game_rail_scroll = QScrollArea()
+        self.game_rail_scroll.setWidgetResizable(True)
+        self.game_rail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.game_rail_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.game_rail_scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }')
+        self.game_rail_scroll.setWidget(self.game_rail)
+        self.game_rail_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.game_rail_scroll.hide()
+        navigation.addSpacing(8)
+        navigation.addWidget(self.game_rail_scroll)
+        navigation.addSpacing(16)
         navigation.addWidget(self.button('Open clip editor', self.open_editor, 'quiet'))
         navigation.addStretch()
         self.connection_badge = QLabel('ENGINE OFFLINE')
@@ -120,7 +150,7 @@ class Window(DesktopWindow):
         navigation.addWidget(self.connection_badge)
         navigation.addSpacing(12)
         navigation.addWidget(self.button('Minimize to tray', self.hide_to_tray, 'quiet'))
-        version = QLabel(f'v{__version__}')
+        version = self.version_label = QLabel(f'v{__version__}')
         version.setObjectName('muted')
         navigation.addWidget(version)
         outer.addWidget(rail)
@@ -129,7 +159,9 @@ class Window(DesktopWindow):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(16)
-        header = QHBoxLayout()
+        self.header_bar = QWidget()  # hidden in the Dial theme, whose pages carry their own titles
+        header = QHBoxLayout(self.header_bar)
+        header.setContentsMargins(0, 0, 0, 0)
         headings = QVBoxLayout()
         self.page_title = QLabel('Capture dashboard')
         self.page_title.setObjectName('pageTitle')
@@ -142,7 +174,7 @@ class Window(DesktopWindow):
         header.addWidget(self.button('Browse all clips', self.browse_library, 'quiet'))
         header.addWidget(self.button('Open editor', self.open_editor, 'quiet'))
         header.addWidget(self.button('Register game folder', self.map_game, 'quiet'))
-        layout.addLayout(header)
+        layout.addWidget(self.header_bar)
         self.status = QLabel('Ready to connect  •  Start the engine to enable capture')
         self.status.setObjectName('status')
         self.status.setWordWrap(True)
@@ -162,12 +194,16 @@ class Window(DesktopWindow):
         menu = self.menuBar().addMenu("File")
         menu.addAction("Open clip editor…", self.open_editor)
         menu.addAction("Open clips folder", self.open_folder)
+        menu.addAction("Browse all clips…", self.browse_library)
+        menu.addAction("Register game folder…", self.map_game)
         menu.addAction("FFmpeg folder…", self.choose_ffmpeg_folder)
         menu.addAction("Open app diagnostics", lambda: self.open_path(DATA))
         menu.addAction("Reconnect capture now", lambda: self.submit("recover_capture", "Manual capture reconnect"))
         menu.addAction("Open recorder logs", lambda: self.open_path(DATA / "native-engine.log"))
         menu.addSeparator()
-        menu.addAction("Exit", self.close)
+        menu.addAction("Exit", self.exit_app)
+        self.settings_action = self.menuBar().addAction("Settings")
+        self.settings_action.triggered.connect(lambda: self.show_page(1))
         help_menu = self.menuBar().addMenu("Help")
         help_menu.addAction("Read setup and limitations", lambda: self.open_path(Path(__file__).resolve().parents[1] / "README.md"))
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
@@ -176,7 +212,7 @@ class Window(DesktopWindow):
         tray_menu.addAction("Show ClipNest", self.show_normal)
         tray_menu.addAction("Save replay", lambda: self.submit("save_replay"))
         tray_menu.addAction("Start / stop recording", lambda: self.submit("toggle_record"))
-        tray_menu.addAction("Exit", self.close)
+        tray_menu.addAction("Exit", self.exit_app)
         self.tray.setContextMenu(tray_menu)
         self.tray.activated.connect(lambda reason: self.show_normal() if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         if not preview:
@@ -192,9 +228,14 @@ class Window(DesktopWindow):
             self.engine.shutdown_done.connect(self.shutdown_complete)
             self.engine.start()
             self.register_hotkeys()
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(40)
+            if self.settings.get('auto_replay'):
+                self.submit('auto_start', AUTO_START_RETRIES)
+        self.volume_timer = QTimer(self)
+        self.volume_timer.setSingleShot(True)
+        self.volume_timer.setInterval(150)  # a slider drag saves the volume once, not at every step
+        self.volume_timer.timeout.connect(self.update_mic)
+        self.volume.valueChanged.connect(self.volume_timer.start)
+        self.mode.currentTextChanged.connect(self.mic_mode_changed)
 
     def button(self, text, callback, name=None):
         result = QPushButton(text)
@@ -203,6 +244,12 @@ class Window(DesktopWindow):
             result.setObjectName(name)
         return result
 
+    def show_page(self, index):
+        """A rail button: its page, and on the Clips page the gallery rather than a clip left open."""
+        if self.quick_player is not None and self.clips_stack.currentWidget() is self.quick_player:
+            self.quick_player.back()
+        self.tabs.setCurrentIndex(index)
+
     def page_changed(self, index):
         titles = {0: ('Capture', ''),
                   1: ('Settings', ''),
@@ -210,8 +257,32 @@ class Window(DesktopWindow):
         title, description = titles[index]
         self.page_title.setText(title)
         self.page_description.setText(description)
+        if index != 2:
+            self.game_rail.choose_none()
+        self.show_header()
         for i, button in self.nav_buttons.items():
             button.setChecked(i == index)
+        self.update_meter_visibility()
+
+    def update_meter_visibility(self):
+        """The recorder measures audio levels only while the Capture page is on screen."""
+        shown = self.isVisible() and not self.isMinimized() and self.tabs.currentIndex() == 0
+        if shown != self.meters_shown and not self.preview and not self.closing:
+            self.meters_shown = shown
+            self.engine.submit('meters', shown)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_meter_visibility()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.update_meter_visibility()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if hasattr(self, 'tabs'):  # style and state changes arrive before __init__ ends
+            self.update_meter_visibility()
 
     def card_heading(self, title, symbol):
         widget = QWidget()
@@ -250,9 +321,7 @@ class Window(DesktopWindow):
         self.replay_metric = QLabel(f"{self.settings['replay_seconds']} sec")
         self.replay_metric.setObjectName('metric')
         body.addWidget(self.replay_metric)
-        self.buffer_label = QLabel('Replay duration')
-        self.buffer_label.setObjectName('muted')
-        self.buffer_label.setWordWrap(True)
+        self.buffer_label = muted('Replay duration')
         body.addWidget(self.buffer_label)
         body.addSpacing(12)
         buttons = QHBoxLayout()
@@ -279,14 +348,10 @@ class Window(DesktopWindow):
         layout.addLayout(cards)
         for button in (self.replay_btn, self.save_btn, self.record_btn):
             button.setEnabled(False)
-        self.shortcut_label = QLabel()
-        self.shortcut_label.setObjectName('muted')
-        self.shortcut_label.setWordWrap(True)
+        self.shortcut_label = muted()
         layout.addWidget(self.shortcut_label)
         self.update_shortcut_label()
-        self.performance = QLabel('Capture statistics appear while the engine is running.')
-        self.performance.setObjectName('muted')
-        self.performance.setWordWrap(True)
+        self.performance = muted('Capture statistics appear while the engine is running.')
         layout.addWidget(self.performance)
         lower = QHBoxLayout()
         lower.setSpacing(16)
@@ -320,9 +385,7 @@ class Window(DesktopWindow):
             meter.setTextVisible(False)
         form.addRow('Microphone', self.mic_meter)
         form.addRow('Desktop', self.desktop_meter)
-        self.mic_label = QLabel('Separate Mix, Desktop and Microphone tracks')
-        self.mic_label.setObjectName('muted')
-        self.mic_label.setWordWrap(True)
+        self.mic_label = muted('Separate Mix, Desktop and Microphone tracks')
         form.addRow(self.mic_label)
         lower.addWidget(audio, 1)
         activity = QGroupBox()
@@ -342,7 +405,68 @@ class Window(DesktopWindow):
         self.capture_scroll.setWidgetResizable(True)
         self.capture_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.capture_scroll.setWidget(page)
-        self.tabs.addTab(self.capture_scroll, 'Capture')
+        from .dial_page import DialPage
+        self.dial_page = DialPage(self)
+        self.capture_stack = QStackedWidget()  # the classic capture page, or the Dial when the theme asks for it
+        self.capture_stack.addWidget(self.capture_scroll)
+        self.capture_stack.addWidget(self.dial_page)
+        self.tabs.addTab(self.capture_stack, 'Capture')
+        self.apply_layout()
+
+    def apply_layout(self):
+        """The theme's layout. The Dial theme has its own Capture page, its games in the left menu and its own
+        Clips page; the classic layout keeps the Clips & games button and the gallery with filters."""
+        from .external_theme import active_layout
+        dial = active_layout() == 'dial'
+        self.capture_stack.setCurrentIndex(1 if dial else 0)
+        if hasattr(self, 'game_rail'):
+            self.rail.setFixedWidth(224 if dial else 200)
+            self.game_rail_scroll.setVisible(dial)
+            self.nav_buttons[2].setVisible(not dial)
+            self.connection_badge.setVisible(not dial)
+            self.version_label.setVisible(not dial)
+            if dial:
+                self.game_rail.refresh()
+        if hasattr(self, 'tabs'):
+            self.show_header()
+        if hasattr(self, 'clips_stack') and self.clips_stack.currentWidget() in (self.clips_page, self.game_gallery):
+            self.clips_stack.setCurrentWidget(self.gallery_page())
+
+    def show_header(self):
+        """The page title and its buttons, and the status line except on the Dial theme's Clips page."""
+        from .external_theme import active_layout
+        dial = active_layout() == 'dial'
+        self.header_bar.setVisible(not dial)
+        self.status.setVisible(not (dial and self.tabs.currentIndex() == 2))
+
+    def gallery_page(self):
+        from .external_theme import active_layout
+        return self.game_gallery if active_layout() == 'dial' else self.clips_page
+
+    def open_game(self, name):
+        """A game in the Dial theme's left menu: its clips on the Clips page."""
+        if self.quick_player is not None and self.clips_stack.currentWidget() is self.quick_player:
+            self.quick_player.release()
+        self.game_gallery.show_game(name)
+        self.clips_stack.setCurrentWidget(self.game_gallery)
+        self.tabs.setCurrentIndex(2)
+        self.game_gallery.list.setFocus()  # Left and Right then step through the clip
+
+    def switch_capture(self, target):
+        """The Dial's capture switch. Capture settings apply only while replay is stopped, so replay stops around
+        the change and starts again. False when the change cannot be made now."""
+        index = self.capture_target.findData(target)
+        if self.recording or index < 0:
+            self.show_error('Stop recording before switching between screen and game capture.')
+            return False
+        self.capture_target.setCurrentIndex(index)
+        restart = self.connected and self.replay
+        if restart:
+            self.submit('toggle_replay')
+        self.apply_settings()
+        if restart:
+            self.submit('toggle_replay')
+        return True
 
     def spin(self, low, high, value, suffix=""):
         control = QSpinBox()
@@ -367,10 +491,7 @@ class Window(DesktopWindow):
             form.setHorizontalSpacing(24)
             form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-            note = QLabel(description)
-            note.setWordWrap(True)
-            note.setObjectName('muted')
-            form.addRow(note)
+            form.addRow(muted(description))
             body.addWidget(group)
             body.addStretch()
             scroll = QScrollArea()
@@ -411,18 +532,26 @@ class Window(DesktopWindow):
             self.capture_method.addItem(label, value)
         self.capture_method.setCurrentIndex(self.capture_method.findData(self.settings.get('capture_method', 2)))
         form.addRow('Display method', self.capture_method)
-        self.game_layer = QCheckBox('Hook fullscreen games on top of the display')
+        self.game_layer = QCheckBox('Hook games that hide from display capture, like VALORANT')
         self.game_layer.setChecked(self.settings.get('game_layer', True))
         self.game_layer.setToolTip('Some games, including VALORANT, are missing from display capture and record as the desktop behind them. '
-                                   'This adds OBS game capture above the display while a fullscreen game on this monitor has focus. '
+                                   'This adds OBS game capture above the display while one of those games is fullscreen on this monitor. '
+                                   'Other games are never hooked, since display capture already records them. '
                                    'Display capture and your method choice stay unchanged.')
         form.addRow('', self.game_layer)
-        self.game_audio_only = QCheckBox("Record only the game's audio")
-        self.game_audio_only.setChecked(self.settings.get('game_audio_only', False))
-        self.game_audio_only.setToolTip('Off (default): the Mix and Desktop tracks record everything you hear. '
-                                        'On: they record only the game, so browsers, music and calls stay out of clips. '
+        self.game_audio_mode = QComboBox()
+        for label, value in (('Everything you hear', 'all'), ('Only the game', 'only'),
+                             ('Everything, plus the game on its own track', 'track')):
+            self.game_audio_mode.addItem(label, value)
+        mode = 'only' if self.settings.get('game_audio_only') else 'track' if self.settings.get('game_audio_track') else 'all'
+        self.game_audio_mode.setCurrentIndex(self.game_audio_mode.findData(mode))
+        self.game_audio_mode.setToolTip('Everything (default): the Mix and Desktop tracks record everything you hear.\n'
+                                        'Only the game: they record only the game, so browsers, music and calls never reach clips.\n'
+                                        'Own track: Mix and Desktop still record everything, and an extra Game track holds only the game. '
+                                        'In the editor, keep Game and Microphone and uncheck Mix and Desktop to leave music out.\n'
                                         'The microphone track is unchanged. Needs Windows 10 version 2004 or newer.')
-        form.addRow('', self.game_audio_only)
+        form.addRow('Game audio', self.game_audio_mode)
+        self.capture_form = form
         self.capture_window = QComboBox()
         self.capture_window.setMinimumContentsLength(20)
         self.capture_window.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -438,16 +567,10 @@ class Window(DesktopWindow):
         self.window_method.setCurrentIndex(self.window_method.findData(self.settings.get('window_method', 2)))
         self.window_options_form.addRow('Window method', self.window_method)
         form.addRow(self.button('Refresh displays / windows', lambda: self.submit('refresh_devices')))
-        window_note = QLabel('Select the game or window, then Apply. Title changes reconnect by application. For osu! or a blank window capture, try Game capture. Restore minimized games before recording. If the game runs as administrator, ClipNest may need the same privileges. Desktop audio records the selected system output.')
-        window_note.setWordWrap(True)
-        window_note.setObjectName('muted')
-        form.addRow(window_note)
+        form.addRow(muted('Select the game or window, then Apply. Title changes reconnect by application. For osu! or a blank window capture, try Game capture. Restore minimized games before recording. If the game runs as administrator, ClipNest may need the same privileges. Desktop audio records the selected system output.'))
         self.capture_target.currentIndexChanged.connect(self.update_capture_controls)
         self.update_capture_controls()
-        note = QLabel('Continuous replay saves consecutive footage within the buffer duration. Older footage expires. Windows Graphics Capture can show a capture border; DXGI avoids it when supported.')
-        note.setWordWrap(True)
-        note.setObjectName('muted')
-        form.addRow(note)
+        form.addRow(muted('Continuous replay saves consecutive footage within the buffer duration. Older footage expires. Windows Graphics Capture can show a capture border; DXGI avoids it when supported.'))
         form = section('Video', 'VIDEO QUALITY', 'Recorder quality is separate from your editor export presets.')
         self.encoder = QComboBox()
         self.encoder.addItems(ENCODERS)
@@ -460,10 +583,7 @@ class Window(DesktopWindow):
         self.nvenc_preset.setEnabled(self.encoder.currentText().startswith('NVIDIA'))
         self.encoder.currentTextChanged.connect(lambda value: self.nvenc_preset.setEnabled(value.startswith('NVIDIA')))
         form.addRow('NVIDIA effort', self.nvenc_preset)
-        effort_note = QLabel('Lower presets reduce encoder work at a quality cost. Resolution and frame rate also affect load. Replay and recording share one encoder.')
-        effort_note.setWordWrap(True)
-        effort_note.setObjectName('muted')
-        form.addRow(effort_note)
+        form.addRow(muted('Lower presets reduce encoder work at a quality cost. Resolution and frame rate also affect load. Replay and recording share one encoder.'))
         resolution = QHBoxLayout()
         self.width = self.spin(64, 4096, self.settings['width'])
         self.height = self.spin(64, 4096, self.settings['height'])
@@ -495,12 +615,27 @@ class Window(DesktopWindow):
         self.app_audio.setToolTip('Records one application, such as Spotify or Discord, on an extra track you can mute or adjust in the editor. '
                                   'It still plays in the Desktop and Mix tracks. Stop capture and use Apply settings to change it.')
         form.addRow('Application track', self.app_audio)
+        self.audio_layout = QComboBox()
+        self.audio_layout.addItem('Standard · Mix, Desktop and Microphone', 'standard')
+        self.audio_layout.addItem(f'One track per app · up to {MAX_TRACKS} sources you choose', 'apps')
+        self.audio_layout.setCurrentIndex(max(0, self.audio_layout.findData(self.settings.get('audio_layout', 'standard'))))
+        self.audio_layout.setToolTip('One track per app records each chosen app, the game and your microphone on separate tracks, '
+                                     'so the editor can keep or cut each one. Mix and Desktop always contain every app; '
+                                     'Windows cannot leave one app out of them. Stop capture and use Apply settings to change tracks.')
+        form.addRow('Audio tracks', self.audio_layout)
+        self.audio_form = form
+        self.track_slots = []
+        saved = self.settings.get('audio_tracks', [])
+        for i in range(MAX_TRACKS):
+            slot = QComboBox()
+            self.fill_track_slot(slot, saved[i] if i < len(saved) else 'off', {})
+            form.addRow(f'Track {i + 1}', slot)
+            self.track_slots.append(slot)
+        self.audio_layout.currentIndexChanged.connect(self.update_audio_controls)
+        self.update_audio_controls()
         form.addRow(self.button('Refresh devices', lambda: self.submit('refresh_devices')))
         form.addRow(self.button('Apply / reconnect audio', self.apply_audio, 'quiet'))
-        audio_note = QLabel('Audio changes apply while capturing. System default follows Windows; a named device stays pinned. Playback follows the Windows output. Switching can leave a brief audio gap.')
-        audio_note.setWordWrap(True)
-        audio_note.setObjectName('muted')
-        form.addRow(audio_note)
+        form.addRow(muted('Audio changes apply while capturing. System default follows Windows; a named device stays pinned. Playback follows the Windows output. Switching can leave a brief audio gap.'))
         self.audio_bitrate = QComboBox()
         self.mic_bitrate = QComboBox()
         for combo, key in ((self.audio_bitrate, 'audio_bitrate'), (self.mic_bitrate, 'mic_bitrate')):
@@ -509,10 +644,7 @@ class Window(DesktopWindow):
             combo.setCurrentIndex(combo.findData(self.settings.get(key, 192)))
         form.addRow('Clip audio (mix + desktop)', self.audio_bitrate)
         form.addRow('Microphone audio', self.mic_bitrate)
-        bitrate_note = QLabel('Bitrate changes take effect after stopping capture and choosing Apply settings.')
-        bitrate_note.setWordWrap(True)
-        bitrate_note.setObjectName('muted')
-        form.addRow(bitrate_note)
+        form.addRow(muted('Bitrate changes take effect after stopping capture and choosing Apply settings.'))
         form = section('Shortcuts', 'KEYBOARD SHORTCUTS', 'Click a field and press your key or combination. Esc cancels. Apply settings to save.')
         self.replay_key = ShortcutField(self.settings['replay_key'])
         self.record_key = ShortcutField(self.settings['record_key'])
@@ -542,10 +674,20 @@ class Window(DesktopWindow):
         self.notification_seconds = self.spin(2, 10, self.settings.get('notification_seconds', 3), ' sec')
         form.addRow('Duration', self.notification_seconds)
         form.addRow(self.button('Preview notification', self.test_notification))
-        note = QLabel('Errors stay visible for at least six seconds. Borderless games are recommended; exclusive fullscreen may hide desktop overlays.')
-        note.setWordWrap(True)
-        note.setObjectName('muted')
-        form.addRow(note)
+        form.addRow(muted('Errors stay visible for at least six seconds. Borderless games are recommended; exclusive fullscreen may hide desktop overlays.'))
+
+        form = section('Startup', 'STARTUP', 'Have ClipNest ready without opening it or clicking anything.')
+        self.launch_at_login = QCheckBox('Start ClipNest when you sign in to Windows')
+        self.launch_at_login.setChecked(self.settings.get('launch_at_login', False))
+        self.launch_at_login.setToolTip('ClipNest opens in the tray, not as a window.')
+        form.addRow(self.launch_at_login)
+        self.auto_replay = QCheckBox('Start the engine and replay whenever ClipNest opens')
+        self.auto_replay.setChecked(self.settings.get('auto_replay', False))
+        form.addRow(self.auto_replay)
+        self.close_to_tray = QCheckBox('Keep ClipNest running in the tray when its window is closed')
+        self.close_to_tray.setChecked(self.settings.get('close_to_tray', False))
+        self.close_to_tray.setToolTip('To quit, choose Exit in the File menu or on the tray icon.')
+        form.addRow(self.close_to_tray)
 
         form = section('Appearance', 'APPEARANCE', 'Your choices save automatically. Tint and refreshing glass update live. Switching the window frame between Classic and Glass requires a restart.')
         self.ui_theme = QComboBox()
@@ -564,14 +706,8 @@ class Window(DesktopWindow):
         palette_row.addWidget(self.button('Built-in colors', lambda: self.select_theme_file('')))
         form.addRow(palette_row)
         form.addRow(self.button('Save theme template', self.save_theme_template, 'quiet'))
-        palette_note = QLabel('JSON color themes apply live to the recorder, editor and player. Edit the file, then Reload. Glass transparency is controlled separately below.')
-        palette_note.setWordWrap(True)
-        palette_note.setObjectName('muted')
-        form.addRow(palette_note)
-        glass_note = QLabel('Glass reveals windows behind ClipNest with a dark tint and native blur. Windows Transparency effects must be enabled. Drag the title bar to move, double-click to maximize, or drag any edge/corner to resize. Classic restores the standard title bar after restart. If needed, launch with --safe-ui.')
-        glass_note.setWordWrap(True)
-        glass_note.setObjectName('muted')
-        form.addRow(glass_note)
+        form.addRow(muted('JSON color themes apply live to the recorder, editor and player. Edit the file, then Reload. Glass transparency is controlled separately below.'))
+        form.addRow(muted('Glass reveals windows behind ClipNest with a dark tint and native blur. Windows Transparency effects must be enabled. Drag the title bar to move, double-click to maximize, or drag any edge/corner to resize. Classic restores the standard title bar after restart. If needed, launch with --safe-ui.'))
         self.tint_slider = QSlider(Qt.Orientation.Horizontal)
         self.tint_slider.setRange(25, 85)
         self.tint_slider.setValue(self._glass_tint)
@@ -581,14 +717,10 @@ class Window(DesktopWindow):
         tint_row.addWidget(self.tint_label)
         self.tint_slider.valueChanged.connect(self.preview_tint)
         form.addRow('Glass tint', tint_row)
-        self.glass_status = QLabel(str(self.property('backdropMode') or 'Glass starts after saving and restarting.'))
-        self.glass_status.setWordWrap(True)
-        self.glass_status.setObjectName('muted')
+        self.glass_status = muted(str(self.property('backdropMode') or 'Glass starts after saving and restarting.'))
         self.backdropChanged.connect(self.glass_status.setText)
         form.addRow('Current effect', self.glass_status)
-        self.appearance_saved = QLabel('Appearance changes save automatically.')
-        self.appearance_saved.setWordWrap(True)
-        self.appearance_saved.setObjectName('muted')
+        self.appearance_saved = muted('Appearance changes save automatically.')
         form.addRow(self.appearance_saved)
         form.addRow(self.button('Open Windows transparency settings', lambda: QDesktopServices.openUrl(QUrl('ms-settings:colors')), 'quiet'))
         form.addRow(self.button('Refresh glass effect', self.refresh_backdrop, 'quiet'))
@@ -616,14 +748,33 @@ class Window(DesktopWindow):
         self.clip_count = QLabel('SAVED THIS SESSION  /  0')
         self.clip_count.setObjectName('muted')
         layout.addWidget(self.clip_count)
-        self.tabs.addTab(page, 'Clips & games')
+        self.clips_stack = QStackedWidget()  # the gallery, or the clip being watched in its place
+        self.clips_stack.addWidget(page)
+        self.clips_page = page
+        from .game_gallery import GameGallery
+        self.game_gallery = GameGallery(self.settings['output'], self)  # the Dial theme's Clips page
+        self.game_gallery.edit_requested.connect(self.open_editor)
+        self.clips_stack.addWidget(self.game_gallery)
+        self.tabs.addTab(self.clips_stack, 'Clips & games')
 
     def watch_clips(self, clips, index):
+        """Play a clip on the Clips page, in place of the gallery."""
         if self.quick_player is None:
             from .gallery import QuickPlayer
+            from .external_theme import apply_inline_palettes
             self.quick_player = QuickPlayer(self)
             self.quick_player.edit_requested.connect(self.open_editor)
+            self.quick_player.closed.connect(self.show_gallery)
+            self.clips_stack.addWidget(self.quick_player)
+            apply_inline_palettes(self.quick_player)  # made after the window's theme was applied
         self.quick_player.open_clips(clips, index)
+        self.clips_stack.setCurrentWidget(self.quick_player)
+        self.tabs.setCurrentIndex(2)
+        self.quick_player.setFocus()
+
+    def show_gallery(self):
+        self.clips_stack.setCurrentWidget(self.gallery_page())
+        self.gallery.list.setFocus()
 
     def browse_library(self):
         from .clip_browser import ClipBrowser
@@ -637,7 +788,7 @@ class Window(DesktopWindow):
         browser.deleteLater()
 
     def choose_theme_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'Load ClipNest color theme', self.settings.get('theme_file', ''), 'ClipNest theme (*.json)')
+        path, _ = QFileDialog.getOpenFileName(self, 'Load ClipNest theme', self.settings.get('theme_file', ''), 'ClipNest theme (*.json)')
         if path:
             self.select_theme_file(path)
 
@@ -669,19 +820,20 @@ class Window(DesktopWindow):
         if not hasattr(self, "ui_theme"):
             return
         self.current_theme = apply_theme(self, self.ui_theme.currentData() or "dark")
-        # Keep any already-open secondary windows visually in sync with the preview.
+        self.apply_layout()
+        self.theme_secondary_windows()
+        self.save_appearance()
+
+    def theme_secondary_windows(self):
+        """Keep already-open secondary windows visually in sync with the main window."""
         if self.editor is not None:
             apply_theme(self.editor, self.current_theme, '\nQPushButton { padding: 6px 9px; }')
-        if self.quick_player is not None:
-            apply_theme(self.quick_player, self.current_theme)
-        self.save_appearance()
 
     def preview_tint(self, value, save=True):
         self.set_glass_tint(value)
         self.tint_label.setText(f'{value}%')
-        for window in (getattr(self, 'editor', None), getattr(self, 'quick_player', None)):
-            if window is not None:
-                window.set_glass_tint(value)
+        if getattr(self, 'editor', None) is not None:
+            self.editor.set_glass_tint(value)
         if save and hasattr(self, 'appearance_saved'):
             self.save_appearance()
 
@@ -722,26 +874,25 @@ class Window(DesktopWindow):
                 from .notifications import export_beep
                 export_beep()
 
-    def choose_ffmpeg_folder(self):
-        # Reuse the editor's validation and preferences, without opening its window.
+    def ensure_editor(self):
+        """The editor window, created on first use; finished exports and export-folder changes refresh the gallery."""
         if self.editor is None:
             from .editor import Editor
             self.editor = Editor(self)
             self.editor.exportCompleted.connect(lambda _path: self.gallery.refresh(automatic=True))
             self.editor.exportFolderChanged.connect(self.gallery.refresh)
-        if self.editor.busy():
+        return self.editor
+
+    def choose_ffmpeg_folder(self):
+        # Reuse the editor's validation and preferences, without opening its window.
+        if self.ensure_editor().busy():
             QMessageBox.information(self, 'FFmpeg folder', 'Wait for the current editor operation to finish before changing FFmpeg.')
             return
         self.editor.choose_tools(dialog_parent=self)
         self.gallery.refresh()
 
     def open_editor(self, path=None):
-        if self.editor is None:
-            from .editor import Editor
-            self.editor = Editor(self)
-            self.editor.exportCompleted.connect(lambda _path: self.gallery.refresh(automatic=True))
-            self.editor.exportFolderChanged.connect(self.gallery.refresh)
-        self.editor.clips_folder = Path(self.settings["output"])
+        self.ensure_editor().clips_folder = Path(self.settings["output"])
         show_centered(self.editor, self)
         if isinstance(path, str):
             self.editor.open_clip(path)
@@ -756,30 +907,40 @@ class Window(DesktopWindow):
             if command == 'save_replay':
                 self.notifications.push('Instant replay saving…', 'Save requested. Waiting for confirmation.', tone='progress')
             self.engine.submit(command, data)
-        if command == "connect":
+        if command in ("connect", "auto_start"):
             self.connect_btn.setEnabled(False)
             self.status.setText("Connecting recorder...")
 
-    def tick(self):
+    def update_mic(self):
         if self.preview or self.closing:
             return
         mode, volume = self.mode.currentText(), self.volume.value()
-        try:
-            pressed = held(self.settings["ptt_key"]) if mode == "Push to talk" and not self.capturing_shortcut else False
-        except ValueError:
-            pressed = False
+        pressed = self.ptt_down and mode == "Push to talk" and not self.capturing_shortcut
         value = (mode, volume, pressed)
         if value != self.last_mic:
             self.engine.submit("mic", value)
             self.last_mic = value
             self.settings.update(mic_mode=mode, mic_volume=volume)
 
+    def watched_ptt(self):
+        return self.settings["ptt_key"] if self.mode.currentText() == "Push to talk" else None
+
+    def mic_mode_changed(self, *_):
+        self.hotkeys.set_ptt(self.watched_ptt())
+        self.update_mic()
+
+    def ptt_state(self, pressed):
+        self.ptt_down = pressed
+        self.update_mic()
+
     def update_state(self, data):
         if self.closing:
             return
-        if data["connected"] and not self.connected:
-            self.last_mic = None
+        reconnected = data["connected"] and not self.connected
         self.connected = data["connected"]
+        if reconnected:  # a fresh recorder needs the microphone state again
+            self.last_mic = None
+            self.update_mic()
         self.connection_badge.setText("ENGINE READY" if self.connected else "ENGINE OFFLINE")
         self.connect_btn.setEnabled(not self.connected)
         self.connect_btn.setText("Engine running" if self.connected else "Start engine")
@@ -796,6 +957,7 @@ class Window(DesktopWindow):
             self.record_btn.style().unpolish(self.record_btn)
             self.record_btn.style().polish(self.record_btn)
             self.save_btn.setEnabled(False)
+            self.dial_page.show_state(None)
             return
         stats = data.get('stats', {})
         if stats:
@@ -825,11 +987,44 @@ class Window(DesktopWindow):
                        if game else "Game capture · waiting for a game")
             if data.get("game_audio"):
                 capture += " · game audio only"
+            elif data.get("game_track"):
+                capture += " · game audio on its own track"
         self.status.setText(f"{'Replay ON' if self.replay else 'Replay off'}  •  {recording}  •  {capture}")
         seconds, buffered = data["replay_seconds"], data.get("buffered")
         warmup = f" • Buffer warming up: {min(int(buffered), seconds)} / {seconds}s" if self.replay and buffered is not None and buffered < seconds else ""
         self.buffer_label.setText(f"Replay length: {seconds} seconds{warmup}")
         self.mic_label.setText(("Mic muted" if data.get("muted") else "Mic live") + f" • Push-to-talk key: {self.settings['ptt_key']}")
+        self.dial_page.show_state(data)
+
+    def update_audio_controls(self, *_):
+        apps = self.audio_layout.currentData() == 'apps'
+        self.audio_form.setRowVisible(self.app_audio, not apps)  # its app gets a track of its own instead
+        for slot in self.track_slots:
+            self.audio_form.setRowVisible(slot, apps)
+        self.update_capture_controls()
+
+    def fill_track_slot(self, slot, selected, running):
+        """Track sources: Off, Mix, Desktop, Microphone, the game, Discord/Spotify/Chrome
+        (even when closed) and the apps playing audio now, keyed by executable."""
+        slot.clear()
+        for label, value in (('Off', 'off'), ('Everything · Mix', 'mix'), ('Everything you hear · Desktop', 'desktop'),
+                             ('Microphone', 'mic'), ("The game you're playing", 'game')):
+            slot.addItem(label, value)
+        apps = {window.split(':')[-1].casefold(): (name, window) for name, window in APP_PRESETS}
+        for exe, (name, window) in running.items():
+            apps.setdefault(exe, (name, window))
+        for name, window in sorted(apps.values(), key=lambda pair: pair[0].casefold()):
+            slot.addItem(name, 'app:' + window)
+        if selected.startswith('app:'):
+            exe = selected.split(':')[-1].casefold()
+            index = next((i for i in range(slot.count()) if (slot.itemData(i) or '').split(':')[-1].casefold() == exe
+                          and slot.itemData(i).startswith('app:')), -1)
+            if index < 0:
+                slot.addItem(f'{app_track_name(selected[4:]) or "Saved app"} (not running)', selected)
+                index = slot.count() - 1
+        else:
+            index = slot.findData(selected)
+        slot.setCurrentIndex(max(0, index))
 
     def update_capture_controls(self, *_):
         window = self.capture_target.currentData() in ("window", "game")
@@ -837,7 +1032,9 @@ class Window(DesktopWindow):
         self.monitor.setEnabled(self.capture_target.currentData() == "display")
         self.capture_method.setEnabled(display)
         self.game_layer.setVisible(display)
-        self.game_audio_only.setVisible(self.capture_target.currentData() == "games")
+        apps = hasattr(self, 'audio_layout') and self.audio_layout.currentData() == 'apps'
+        # One track per app has its own Game track choice.
+        self.capture_form.setRowVisible(self.game_audio_mode, self.capture_target.currentData() == "games" and not apps)
         self.capture_window.setEnabled(window)
         self.window_method.setEnabled(self.capture_target.currentData() == "window")
         self.window_options.setVisible(window)
@@ -885,6 +1082,9 @@ class Window(DesktopWindow):
                 apps.setdefault(value.split(':')[-1].casefold(), (item['itemName'], value))
         for name, value in sorted(apps.values(), key=lambda pair: pair[0].casefold()):
             self.app_audio.addItem(name, value)
+        running = {exe: (app_track_name(value) or name, value) for exe, (name, value) in apps.items()}
+        for slot in self.track_slots:
+            self.fill_track_slot(slot, slot.currentData() or 'off', running)
         if selected:
             exe = selected.split(':')[-1].casefold()
             index = next((i for i in range(self.app_audio.count())
@@ -898,6 +1098,8 @@ class Window(DesktopWindow):
         for name, meter in [(MIC, self.mic_meter), (DESKTOP, self.desktop_meter)]:
             db = 20 * math.log10(max(float(levels.get(name, 0)), .001))
             meter.setValue(round(max(0, min(100, (db + 60) / 60 * 100))))
+        self.dial_page.show_meter('Microphone', self.mic_meter.value())
+        self.dial_page.show_meter('Desktop', self.desktop_meter.value())
 
     def log(self, text):
         self.messages.appendPlainText(text)
@@ -930,6 +1132,20 @@ class Window(DesktopWindow):
         if not self.gallery.exported:
             self.gallery.listed([clip]+[c for c in self.gallery.clips if c['path'] != path][:23], [])
         QTimer.singleShot(150, lambda: self.gallery.refresh(automatic=True))
+        self.remember_game_icon(source)
+        if self.game_rail_scroll.isVisible():
+            self.game_rail.refresh()
+        QTimer.singleShot(150, lambda: self.game_gallery.refresh(automatic=True))
+
+    def remember_game_icon(self, clip):
+        """The game being captured made this clip; keep its program for the game's icon in the Dial theme."""
+        from .game_gallery import known_icons, remember_icons
+        folder, exe = clip.parent.name, self.last_app.get('exe') or ''
+        if exe.lower().endswith('.exe') and self.last_app.get('category') == folder and not known_icons().get(folder):
+            try:
+                remember_icons({folder: exe})
+            except OSError:
+                logging.exception('Game icon not remembered')
 
     def update_shortcut_label(self):
         self.shortcut_label.setText(f"Save replay: {self.settings['replay_key']}     Record: {self.settings['record_key']}")
@@ -938,7 +1154,7 @@ class Window(DesktopWindow):
         if self.capturing_shortcut or self.closing:
             return
         try:
-            self.hotkeys.configure(self.settings["replay_key"], self.settings["record_key"])
+            self.hotkeys.configure(self.settings["replay_key"], self.settings["record_key"], self.watched_ptt())
         except ValueError as exc:
             self.show_error(str(exc))
 
@@ -949,6 +1165,7 @@ class Window(DesktopWindow):
         self.capturing_shortcut = active
         if active:
             self.hotkeys.close()
+            self.update_mic()  # the microphone closes while a push-to-talk key is being chosen
         elif not self.preview:
             self.register_hotkeys()
 
@@ -973,13 +1190,18 @@ class Window(DesktopWindow):
             data.update(output=self.output.text().strip(), storage_limit_gb=self.storage_limit.value(), replay_seconds=self.seconds.value(), replay_mode=self.replay_mode.currentData(),
                         encoder=self.encoder.currentText(), nvenc_preset=self.nvenc_preset.currentData(), capture_method=self.capture_method.currentData(), width=self.width.value(), height=self.height.value(),
                         capture_target=self.capture_target.currentData(), window_value=self.capture_window.currentData() or "", window_method=self.window_method.currentData(),
-                        game_layer=self.game_layer.isChecked(), game_audio_only=self.game_audio_only.isChecked(),
+                        game_layer=self.game_layer.isChecked(), game_audio_only=self.game_audio_mode.currentData() == 'only',
+                        game_audio_track=self.game_audio_mode.currentData() == 'track',
                         app_audio=self.app_audio.currentData() or "",
+                        audio_layout=self.audio_layout.currentData(),
+                        audio_tracks=[slot.currentData() or 'off' for slot in self.track_slots],
                         fps=int(self.fps.currentText()), bitrate=self.bitrate.value(),
                         audio_bitrate=self.audio_bitrate.currentData(), mic_bitrate=self.mic_bitrate.currentData(),
                         mic_device=self.mic.currentData() or self.settings["mic_device"],
                         desktop_device=self.output_device.currentData() or self.settings["desktop_device"],
                         replay_key=replay_key, record_key=record_key, ptt_key=ptt_key,
+                        launch_at_login=self.launch_at_login.isChecked(), auto_replay=self.auto_replay.isChecked(),
+                        close_to_tray=self.close_to_tray.isChecked(),
                         ui_theme=self.ui_theme.currentData() or self.current_theme, glass_tint=self.tint_slider.value())
             data.update(self.notification_options())
             if self.monitor.currentData() is not None:
@@ -1005,10 +1227,8 @@ class Window(DesktopWindow):
                 self.ui_theme.blockSignals(True)
                 self.ui_theme.setCurrentIndex(index)
                 self.ui_theme.blockSignals(False)
-        if self.editor is not None:
-            apply_theme(self.editor, self.current_theme, '\nQPushButton { padding: 6px 9px; }')
-        if self.quick_player is not None:
-            apply_theme(self.quick_player, self.current_theme)
+        self.theme_secondary_windows()
+        self.dial_page.show_settings(self.settings)
         self.notifications.settings = self.settings
         self.gallery.storage.root = Path(data["output"])
         self.gallery.storage.quota = data.get("storage_limit_gb", 0)
@@ -1019,6 +1239,13 @@ class Window(DesktopWindow):
         self.update_shortcut_label()
         self.register_hotkeys()
         self.last_mic = None
+        self.update_mic()
+        if not self.preview:
+            try:
+                autostart.sync(data.get('launch_at_login', False))
+            except OSError as exc:
+                logging.exception('Start with Windows could not be changed')
+                self.show_error(f'Start with Windows could not be changed: {exc}')
 
     def choose_output(self):
         path = QFileDialog.getExistingDirectory(self, "Choose clips folder", self.output.text())
@@ -1055,29 +1282,41 @@ class Window(DesktopWindow):
             self.showMinimized()
 
     def close_join_jobs(self):
-        from .join_dialog import JoinDialog
+        """Cancel a running combine before quitting. False while one is still stopping."""
+        from .editor import Job
         busy = False
-        for dialog in self.findChildren(JoinDialog):
-            if dialog.job is not None:
-                dialog.job.cancel.set()
-                dialog.status.setText('Cancelling before ClipNest closes…')
+        for job in self.findChildren(Job, 'combine'):
+            if job.isRunning():
+                job.cancel.set()
                 busy = True
         return not busy
 
+    def exit_app(self):
+        self.quitting = True
+        self.close()
+
     def closeEvent(self, event):
+        if (self.settings.get('close_to_tray') and not (self.quitting or self.allow_close or self.preview)
+                and QSystemTrayIcon.isSystemTrayAvailable()):
+            event.ignore()
+            self.hide()
+            return
         if not self.close_join_jobs():
             event.ignore()
             QTimer.singleShot(200, self.close)
             return
         if self.editor is not None and not self.editor.can_close():
+            self.quitting = False
             event.ignore()
             return
         if self.editor is not None:
             self.editor.hide()
         if self.allow_close or self.preview:
             self.gallery.stop()
+            self.game_gallery.stop()
+            self.game_rail.stop()
             if self.quick_player is not None:
-                self.quick_player.close()
+                self.quick_player.release()
             self.hotkeys.close()
             if self.system_events is not None:
                 self.system_events.close()

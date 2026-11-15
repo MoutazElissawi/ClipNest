@@ -10,6 +10,13 @@ ENGINE = DATA / "engine"
 SETTINGS = DATA / "settings.json"
 ENCODERS = {"NVIDIA H.264": "obs_nvenc_h264_tex", "NVIDIA AV1": "obs_nvenc_av1_tex", "CPU H.264 (fallback)": "obs_x264"}
 ENCODERS.update({"AMD H.264": "h264_texture_amf", "AMD HEVC": "h265_texture_amf", "AMD AV1": "av1_texture_amf"})
+GAME_TRACK = 5  # OBS mixer for the separate game audio track; 1-3 are Mix/Desktop/Microphone, 4 the application
+MAX_TRACKS = 6  # libobs mixes audio into at most six tracks
+# "One track per app" choices offered even when the app is closed; the source matches by executable.
+APP_PRESETS = (("Discord", "Discord::Discord.exe"), ("Spotify", "Spotify::Spotify.exe"), ("Chrome", "Google Chrome::chrome.exe"))
+DEFAULT_AUDIO_TRACKS = ["mix", "game"] + ["app:" + window for _, window in APP_PRESETS] + ["mic"]
+OLD_DEFAULT_AUDIO_TRACKS = ["mix", "game", "mic"] + ["app:" + window for _, window in APP_PRESETS]  # the 2.1.6 default
+TRACK_TITLES = {"mix": "Mix", "desktop": "Desktop", "mic": "Microphone", "game": "Game"}
 
 
 def atomic_json(path: Path, value):
@@ -25,11 +32,12 @@ def load_settings():
                     encoder="NVIDIA H.264", nvenc_preset="p4", mic_device="default", desktop_device="default",
                     audio_bitrate=192, mic_bitrate=192,
                     monitor_property="monitor_id", monitor_value=None, capture_method=2,
-                    capture_target="games", window_value="", window_method=2, game_layer=True, game_audio_only=False, app_audio="", export_sound=True,
+                    capture_target="games", window_value="", window_method=2, game_layer=True, game_audio_only=False, game_audio_track=False, app_audio="", export_sound=True,
                     mic_mode="Always on", mic_volume=100, ptt_key="F8",
                     replay_key="Ctrl+Shift+F10", record_key="Ctrl+Shift+F9",
                     games={}, ui_theme='dark', theme_file='', glass_tint=46, notifications_enabled=True, notification_corner='Top right',
-                    notification_seconds=3, notification_screen='')
+                    notification_seconds=3, notification_screen='', launch_at_login=False, auto_replay=True, close_to_tray=False,
+                    audio_layout="standard", audio_tracks=list(DEFAULT_AUDIO_TRACKS))
     pristine = dict(defaults)
     if os.name != 'nt':
         pristine['encoder'] = defaults['encoder'] = 'CPU H.264 (fallback)'
@@ -62,6 +70,8 @@ def load_settings():
                 repaired.append(key)
                 if key == "encoder":
                     defaults[key] = "CPU H.264 (fallback)"
+        if 'close_to_tray' not in saved:
+            defaults['auto_replay'] = True  # saved before replay started with the app; on until the user changes it
         if repaired:
             from datetime import datetime
             import shutil
@@ -86,6 +96,10 @@ def load_settings():
         logging.exception('Could not load appearance preferences; using saved recorder settings')
     defaults.pop("password", None)
     defaults.pop("port", None)
+    if defaults["game_audio_only"] and defaults["game_audio_track"]:
+        defaults["game_audio_track"] = False  # each was valid alone; game-only audio wins
+    if defaults["audio_tracks"] == OLD_DEFAULT_AUDIO_TRACKS:
+        defaults["audio_tracks"] = list(DEFAULT_AUDIO_TRACKS)  # the game is followed by the apps; nobody picked the old order
     validate(defaults)
     return defaults
 
@@ -104,9 +118,22 @@ def save_appearance(theme, tint, theme_file=None):
 
 
 def app_track_name(window_value):
-    """Track title for the per-application audio track, e.g. 'Spotify'."""
+    """Track title for the per-application audio track, e.g. 'Spotify' or 'Chrome'."""
     exe = (window_value or "").split(":")[-1].replace("#3A", ":")
-    return Path(exe).stem[:40] if exe else ""
+    stem = Path(exe).stem[:40] if exe else ""
+    return stem[:1].upper() + stem[1:]
+
+
+def track_layout(s):
+    """'One track per app' tracks in file order as (title, kind, window); None for the standard layout."""
+    if s.get("audio_layout", "standard") != "apps":
+        return None
+    layout = []
+    for track in s.get("audio_tracks", DEFAULT_AUDIO_TRACKS):
+        kind, _, window = track.partition(":")
+        if kind != "off":
+            layout.append((TRACK_TITLES.get(kind) or app_track_name(window) or "Application", kind, window))
+    return layout
 
 
 def validate(s):
@@ -133,6 +160,31 @@ def validate(s):
         raise ValueError("Game layer must be on or off.")
     if type(s.get("game_audio_only", False)) is not bool:
         raise ValueError("Game-only audio must be on or off.")
+    if type(s.get("game_audio_track", False)) is not bool:
+        raise ValueError("The separate game audio track must be on or off.")
+    if s.get("audio_layout", "standard") not in ("standard", "apps"):
+        raise ValueError("Choose standard audio tracks or one track per app.")
+    tracks = s.get("audio_tracks", DEFAULT_AUDIO_TRACKS)
+    if type(tracks) is not list or len(tracks) > MAX_TRACKS or not all(isinstance(t, str) for t in tracks):
+        raise ValueError(f"Choose up to {MAX_TRACKS} audio tracks.")
+    sources = []
+    for track in tracks:
+        kind, _, window = track.partition(":")
+        if kind == "app" and len(window.split(":")) == 3:
+            sources.append(window.split(":")[-1].casefold())
+        elif kind in TRACK_TITLES and not window:
+            sources.append(kind)
+        elif track != "off":
+            raise ValueError("Choose a valid source for every audio track.")
+    if len(set(sources)) != len(sources):
+        raise ValueError("Each audio track needs a different source.")
+    if s.get("audio_layout") == "apps" and not sources:
+        raise ValueError("Choose at least one audio track.")
+    for key in ("launch_at_login", "auto_replay", "close_to_tray"):
+        if type(s.get(key, False)) is not bool:
+            raise ValueError("Startup options must be on or off.")
+    if s.get("game_audio_only") and s.get("game_audio_track"):
+        raise ValueError("Choose either game-only audio or a separate game track, not both.")
     if s.get("window_method", 2) not in (0, 1, 2):
         raise ValueError("Choose a supported window capture method.")
     if not isinstance(s.get("window_value", ""), str):

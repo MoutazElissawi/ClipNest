@@ -36,10 +36,19 @@ class StorageWidget(QWidget):
         layout.addWidget(self.bar)
         layout.addWidget(self.note)
         self.setToolTip('Completed media in the clip folder. Excludes replay cache, staging files and linked folders. GB = 1,000,000,000 bytes. Limit is advisory; clips are never deleted automatically.')
+        # Rechecked only while visible: nobody reads it behind a game, and showing it refreshes it.
         self.timer = QTimer(self)
         self.timer.setInterval(30000)
         self.timer.timeout.connect(self.refresh)
-        self.timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.stopped:
+            self.timer.start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.timer.stop()
 
     def refresh(self):
         if self.stopped or self.worker:

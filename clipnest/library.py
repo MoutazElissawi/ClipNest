@@ -10,6 +10,41 @@ from .config import DATA
 
 MEDIA = {'.mkv', '.mp4', '.mov', '.avi', '.webm', '.m4v'}
 GB = 1_000_000_000
+SKIPPED_FOLDERS = ('_Unsorted', '_ReplayCache')  # staging and replay cache, never finished clips
+
+
+def media_files(root, cancel, extensions=MEDIA, onerror=None, skip=()):
+    """(path, stat) of each non-empty media file under root; skips hidden, staging and linked folders and files.
+    Windows lists sizes and times with the folder, so no file is opened or stat'ed. Those stats have no file id;
+    os.stat the path when one is needed. `skip` holds os.path.normcase paths of files and folders to leave out."""
+    folders = [str(root)]
+    while folders:
+        try:
+            with os.scandir(folders.pop()) as listing:
+                entries = list(listing)
+        except OSError as exc:
+            if onerror is not None:
+                onerror(exc)
+            continue
+        for entry in entries:
+            if cancel.is_set():
+                return
+            if entry.name.startswith('.'):
+                continue
+            try:
+                stat = entry.stat(follow_symlinks=False)
+                if entry.is_symlink() or getattr(stat, 'st_file_attributes', 0) & 0x400:  # links and junctions
+                    continue
+                if os.path.normcase(entry.path) in skip:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name not in SKIPPED_FOLDERS:
+                        folders.append(entry.path)
+                elif stat.st_size and os.path.splitext(entry.name)[1].lower() in extensions:
+                    yield entry.path, stat
+            except OSError as exc:
+                if onerror is not None:
+                    onerror(exc)
 
 
 def linked(path):
@@ -100,29 +135,11 @@ def storage_usage(root, cancel):
     root = Path(root)
     total = count = 0
     errors = []
-    for base, dirs, files in os.walk(root, followlinks=False, onerror=lambda e: errors.append(str(e)) if not isinstance(e, FileNotFoundError) else None):
-        if cancel.is_set():
-            return None
-        kept = []
-        for name in dirs:
-            try:
-                if not name.startswith('.') and name not in ('_Unsorted', '_ReplayCache') and not linked(Path(base)/name):
-                    kept.append(name)
-            except OSError as exc:
-                errors.append(str(exc))
-        dirs[:] = kept
-        for name in files:
-            if cancel.is_set():
-                return None
-            path = Path(base)/name
-            try:
-                if path.suffix.lower() in MEDIA and not name.startswith('.') and not linked(path):
-                    size = path.stat().st_size
-                    if size:
-                        total += size
-                        count += 1
-            except OSError as exc:
-                errors.append(str(exc))
+    for _, stat in media_files(root, cancel, onerror=lambda e: errors.append(str(e)) if not isinstance(e, FileNotFoundError) else None):
+        total += stat.st_size
+        count += 1
+    if cancel.is_set():
+        return None
     volume = root
     while not volume.exists() and volume != volume.parent:
         volume = volume.parent

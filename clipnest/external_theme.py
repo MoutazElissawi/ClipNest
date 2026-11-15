@@ -1,8 +1,13 @@
-"""Versioned, data-only external palettes. No QSS, executable code or asset URLs."""
+"""Versioned, data-only external themes. No QSS, executable code or asset URLs.
+Version 1 holds colors. Version 2 may also name a font file kept beside the theme and one of the built-in layouts."""
 from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+LAYOUTS = ('classic', 'dial')
+FONT_SUFFIXES = ('.ttf', '.otf')
+MAX_FONT_BYTES = 2 * 1024 * 1024
 
 DEFAULT_COLORS = {
     'background': '#101010', 'surface': '#181818', 'raised': '#272727',
@@ -25,7 +30,9 @@ ALIASES = {
     'danger': ['#a92b35', '#9c3940'], 'danger_hover': ['#c23642'],
 }
 _active = None
-_active_path = ''
+_aliases = {}  # built-in hex color -> the active palette's color for its role
+_font_family = None  # family of the active theme's font, once Qt has loaded it
+_loaded_fonts = {}  # font file -> family, so reloading a theme does not add the font again
 
 
 def load_palette(path):
@@ -38,10 +45,12 @@ def load_palette(path):
         raw = json.loads(source.read_text(encoding='utf-8-sig'))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f'Invalid theme JSON: {exc}') from exc
-    if not isinstance(raw, dict) or set(raw)-{'schema_version', 'name', 'colors'}:
-        raise ValueError('Theme must contain only schema_version, name and colors.')
-    if type(raw.get('schema_version')) is not int or raw['schema_version'] != 1:
-        raise ValueError('Unsupported theme schema_version; expected 1.')
+    version = raw.get('schema_version') if isinstance(raw, dict) else None
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError('Unsupported theme schema_version; expected 1 or 2.')
+    allowed = {'schema_version', 'name', 'colors'} | ({'font', 'layout'} if version == 2 else set())
+    if set(raw)-allowed:
+        raise ValueError('Theme must contain only ' + ', '.join(sorted(allowed)) + '.')
     name = raw.get('name')
     if not isinstance(name, str) or not name.strip() or len(name) > 80:
         raise ValueError('Theme name must contain 1–80 characters.')
@@ -51,14 +60,45 @@ def load_palette(path):
     for key, value in colors.items():
         if not isinstance(value, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', value):
             raise ValueError(f'{key} must be a six-digit hex color, such as #76b900.')
-    return dict(schema_version=1, name=name.strip(), colors=dict(DEFAULT_COLORS, **colors))
+    palette = dict(schema_version=version, name=name.strip(), colors=dict(DEFAULT_COLORS, **colors))
+    if 'font' in raw:
+        font = raw['font']
+        # A plain file name, so a theme can only use a font shipped in its own folder.
+        if not isinstance(font, str) or Path(font).name != font or Path(font).suffix.lower() not in FONT_SUFFIXES:
+            raise ValueError('font must be the name of a .ttf or .otf file in the theme folder, such as Sora.ttf.')
+        file = source.parent/font
+        if not file.is_file():
+            raise ValueError(f'The theme font {font} is missing from {source.parent}.')
+        if file.stat().st_size > MAX_FONT_BYTES:
+            raise ValueError('Theme fonts must be smaller than 2 MB.')
+        palette['font'] = font
+    if 'layout' in raw:
+        if raw['layout'] not in LAYOUTS:
+            raise ValueError('layout must be one of: ' + ', '.join(LAYOUTS) + '.')
+        palette['layout'] = raw['layout']
+    return palette
+
+
+def register_font(file):
+    """Load a font file into Qt and return its family, or None when Qt cannot read it."""
+    file = str(Path(file).resolve())
+    if file not in _loaded_fonts:
+        from PySide6.QtGui import QFontDatabase
+        font_id = QFontDatabase.addApplicationFont(file)
+        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+        if not families:
+            raise ValueError(f'{Path(file).name} is not a font Qt can read.')
+        _loaded_fonts[file] = families[0]
+    return _loaded_fonts[file]
 
 
 def set_palette(path):
     """Validate before replacing the active palette. Failure leaves it untouched."""
-    global _active, _active_path
+    global _active, _aliases, _font_family
     palette = load_palette(path) if path else None
-    _active, _active_path = palette, str(path or '')
+    family = register_font(Path(path).parent/palette['font']) if palette and palette.get('font') else None
+    _active, _font_family = palette, family
+    _aliases = {color: palette['colors'][role] for role, values in ALIASES.items() for color in values} if palette else {}
     return palette
 
 
@@ -66,16 +106,25 @@ def active_palette():
     return _active
 
 
+def active_layout():
+    return (_active or {}).get('layout', 'classic')
+
+
+def active_font():
+    return _font_family
+
+
 def palette_style(qss):
     if _active is None:
         return qss
     colors = _active['colors']
-    aliases = {color: colors[role] for role, values in ALIASES.items() for color in values}
+    if _font_family:
+        qss = qss.replace("font-family: 'Segoe UI'", f"font-family: '{_font_family}'")
     def color(match):
         token = match.group().lower()
         if len(token) == 4:
             token = '#' + ''.join(c*2 for c in token[1:])
-        return aliases.get(token, match.group())
+        return _aliases.get(token, match.group())
     qss = re.sub(r'#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b', color, qss)
     def rgba(match):
         r, g, b, alpha = map(int, match.groups())
@@ -95,6 +144,8 @@ def apply_inline_palettes(window):
             continue
         current = widget.styleSheet()
         last = getattr(widget, '_palette_last_qss', None)
+        if last is None and not current:
+            continue  # most widgets use only their window's stylesheet
         if last is None or current != last:
             widget._palette_base_qss = current
         base = getattr(widget, '_palette_base_qss', current)

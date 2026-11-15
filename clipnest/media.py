@@ -17,6 +17,19 @@ ENCODERS = {'NVIDIA H.264': 'h264_nvenc', 'NVIDIA AV1': 'av1_nvenc',
             'CPU H.264': 'libx264'}
 # Stream copy: video packets pass through untouched; audio is copied unless edited.
 COPY = 'Copy (no re-encode)'
+# Recorder tracks with a source of their own. Any other title is an app or the game,
+# which the Desktop track also contains (system output capture cannot leave one out).
+OWN_SOURCE_TRACKS = {'mix', 'desktop', 'microphone'}
+
+
+def doubled_tracks(titles):
+    """Titles that repeat other tracks when combined: Mix holds every track, and Desktop
+    holds every app and the game."""
+    titles = {title.strip().casefold() for title in titles}
+    doubled = {'mix'} if len(titles) > 1 else set()
+    if titles - OWN_SOURCE_TRACKS:
+        doubled.add('desktop')
+    return doubled & titles
 
 
 def run(args, **kwargs):
@@ -87,6 +100,18 @@ def available_encoders(ffmpeg, cancel=None):
     return available, failures
 
 
+def source_rate(video):
+    """The stream's average frame rate as 'num/den', or None when ffprobe does not know it."""
+    for value in (video.get('avg_frame_rate'), video.get('r_frame_rate')):
+        try:
+            rate = Fraction(value)
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if 0 < rate <= 1000:
+            return f'{rate.numerator}/{rate.denominator}'
+    return None
+
+
 class EncoderProbeCache:
     """Short-lived editor capability checks; manual recheck always bypasses."""
     def __init__(self, inspect):
@@ -94,13 +119,26 @@ class EncoderProbeCache:
         self.entry = None
         self.lock = threading.Lock()
 
-    def get(self, ffmpeg, force=False):
+    @staticmethod
+    def key(ffmpeg):
         path = Path(ffmpeg).resolve()
         try:
             stat = path.stat()
-            key = (str(path), stat.st_size, stat.st_mtime_ns)
+            return (str(path), stat.st_size, stat.st_mtime_ns)
         except OSError:
-            key = (str(path),)
+            return (str(path),)
+
+    def cached(self, ffmpeg):
+        """The last result for this ffmpeg and whether it is still fresh, or None; never runs the test.
+        Lock-free, so opening a clip does not wait behind a background re-test."""
+        entry = self.entry
+        if not entry or entry[0] != self.key(ffmpeg):
+            return None
+        labels, errors = entry[2]
+        return (list(labels), dict(errors)), time.monotonic() < entry[1]
+
+    def get(self, ffmpeg, force=False):
+        key = self.key(ffmpeg)
         with self.lock:
             now = time.monotonic()
             if not force and self.entry and self.entry[0] == key and now < self.entry[1]:
@@ -227,8 +265,11 @@ def export_args(info, edit, ffmpeg, destination):
         filters += [f'scale={fw}:{fh}:flags=lanczos', 'setsar=1', f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2']
     if edit.fps not in (0, 24, 30, 60):
         raise ValueError('Choose source FPS, 24, 30 or 60.')
-    if edit.fps:
-        filters.append(f'fps={edit.fps}')
+    # After -ss the first frame can land a few ms after 0 s. Signal reads the frame at exactly 0 s for its
+    # preview and size, so pad from 0 with copies of the first frame (audio stays in sync).
+    rate = edit.fps or source_rate(info['video'])
+    if rate:
+        filters.append(f'fps={rate}:start_time=0')
     filters += [f'eq=brightness={edit.brightness}:contrast={edit.contrast}:saturation={edit.saturation}', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', 'format=yuv420p']
     args = [ffmpeg, '-hide_banner', '-v', 'error', '-nostdin', '-n', '-ss', f'{edit.start:.6f}', '-i', info['path'],
             '-t', f'{edit.end-edit.start:.6f}', '-map', f"0:{info['video']['index']}"]
@@ -251,6 +292,9 @@ def export_args(info, edit, ffmpeg, destination):
     seen = set()
     if edit.remix and len(edit.audio) > 1 and any(title.strip().casefold() == 'mix' for _, title, _ in edit.audio):
         raise ValueError('Uncheck the existing Mix track before combining isolated tracks; otherwise audio is doubled.')
+    if edit.remix and 'desktop' in doubled_tracks(title for _, title, _ in edit.audio):
+        raise ValueError('Desktop already contains the game and every app. Uncheck Desktop, or the Game and app tracks, '
+                         'before combining tracks; otherwise they are doubled.')
     mix_filters = []
     for ranges in (edit.mutes or {}).values():
         if any(not (math.isfinite(a) and math.isfinite(b) and 0 <= a < b <= info['duration'] + .001) for a, b in ranges):
@@ -293,6 +337,45 @@ def file_identity(path):
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
+def run_ffmpeg(args, duration, cancel, progress, cancelled, failed):
+    """Run an FFmpeg command that writes -progress to stdout, reporting 0-99% of `duration` seconds.
+    Cancelling stops FFmpeg and raises ValueError(cancelled); a failure raises FFmpeg's error text, or `failed`."""
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors, text=True,
+                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+        def read_progress():
+            for line in process.stdout:
+                if line.startswith('out_time_us='):
+                    try:
+                        progress(min(99, max(0, int(float(line.split('=')[1]) / (duration * 10000)))))
+                    except ValueError:
+                        pass
+        reader = threading.Thread(target=read_progress, daemon=True)
+        reader.start()
+        try:
+            while process.poll() is None:
+                if cancel.wait(.1):
+                    process.terminate()
+                    try:
+                        process.wait(3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    break
+            process.wait()
+            reader.join(3)
+            if cancel.is_set():
+                raise ValueError(cancelled)
+            if process.returncode:
+                errors.seek(0)
+                raise ValueError(errors.read().decode('utf-8', 'replace')[-3000:] or failed)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            reader.join(3)
+            process.stdout.close()
+
+
 def export_clip(info, edit, ffmpeg, target, cancel=None, progress=None, *, overwrite=False, expected_target=None):
     target = Path(target).resolve()
     if target.suffix.lower() not in ('.mkv', '.mp4', '.mp3', '.wav', '.flac', '.m4a'):
@@ -312,55 +395,24 @@ def export_clip(info, edit, ffmpeg, target, cancel=None, progress=None, *, overw
     # Private sibling directory keeps promotion on the same filesystem.
     with tempfile.TemporaryDirectory(prefix='.clipnest-export-', dir=target.parent) as temp:
         partial = Path(temp) / target.name
-        args = export_args(info, edit, ffmpeg, partial)
-        with tempfile.TemporaryFile() as errors:
-            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors, text=True,
-                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-            def read_progress():
-                for line in process.stdout:
-                    if line.startswith('out_time_us=') and progress:
-                        try:
-                            progress(min(99, max(0, int(float(line.split('=')[1]) / ((edit.end-edit.start)*10000)))))
-                        except ValueError:
-                            pass
-            reader = threading.Thread(target=read_progress, daemon=True)
-            reader.start()
-            try:
-                while process.poll() is None:
-                    if cancel.wait(.1):
-                        process.terminate()
-                        try:
-                            process.wait(3)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                        break
-                process.wait()
-                reader.join()
-                if cancel.is_set():
-                    raise ValueError('Export cancelled. Original unchanged.')
-                if process.returncode or not partial.exists() or partial.stat().st_size == 0:
-                    errors.seek(0)
-                    raise ValueError(errors.read().decode('utf-8', 'replace')[-3000:] or 'Export failed.')
-                # A confirmed replacement is published only after successful encoding.
-                # Unconfirmed new destinations retain exclusive no-overwrite publication.
-                try:
-                    if overwrite:
-                        export_args(info, edit, ffmpeg, target)  # recheck source identity before replacement
-                        if not target.exists() or file_identity(target) != approved:
-                            raise ValueError('The destination changed during export. It was not replaced.')
-                        os.replace(partial, target)
-                    else:
-                        os.link(partial, target)
-                except OSError as exc:
-                    raise ValueError(f'Cannot publish export safely. Choose a new name on an NTFS/local drive. {exc}') from exc
-                if progress:
-                    progress(100)
-            finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-                reader.join(timeout=3)
-                process.stdout.close()
+        run_ffmpeg(export_args(info, edit, ffmpeg, partial), edit.end-edit.start, cancel, progress or (lambda percent: None),
+                   'Export cancelled. Original unchanged.', 'Export failed.')
+        if not partial.exists() or partial.stat().st_size == 0:
+            raise ValueError('Export failed.')
+        # A confirmed replacement is published only after successful encoding.
+        # Unconfirmed new destinations retain exclusive no-overwrite publication.
+        try:
+            if overwrite:
+                export_args(info, edit, ffmpeg, target)  # recheck source identity before replacement
+                if not target.exists() or file_identity(target) != approved:
+                    raise ValueError('The destination changed during export. It was not replaced.')
+                os.replace(partial, target)
+            else:
+                os.link(partial, target)
+        except OSError as exc:
+            raise ValueError(f'Cannot publish export safely. Choose a new name on an NTFS/local drive. {exc}') from exc
+        if progress:
+            progress(100)
     return str(target)
 
 

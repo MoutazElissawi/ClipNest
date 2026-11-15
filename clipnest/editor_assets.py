@@ -5,7 +5,6 @@ from pathlib import Path
 import subprocess
 import tempfile
 import time
-import numpy as np
 
 
 def captured_file(args, output, cancel, timeout=120):
@@ -29,6 +28,7 @@ def captured_file(args, output, cancel, timeout=120):
 
 
 def waveform(info, index, ffmpeg, cancel, bins=1600):
+    import numpy as np  # the editor alone needs it; the recorder starts without it
     with tempfile.TemporaryFile() as data:
         captured_file([ffmpeg, '-v', 'error', '-nostdin', '-i', info['path'], '-map', f'0:{index}',
             '-vn', '-ac', '1', '-ar', '8000', '-f', 'f32le', '-'], data, cancel)
@@ -73,23 +73,14 @@ def thumbnail(path, ffmpeg, cache, cancel):
 
 def scan_clips(root, cancel, limit=10000):
     from .preview import VIDEO_EXTENSIONS
+    from .library import media_files
     clips = []
     errors = []
-    for directory, folders, files in os.walk(root, onerror=lambda exc: errors.append(str(exc))):
-        from .library import linked
-        folders[:] = [f for f in folders if not f.startswith('.') and f not in ('_ReplayCache', '_Unsorted') and not linked(Path(directory)/f)]
-        for filename in files:
-            if cancel.is_set():
-                return [], False, errors
-            path = Path(directory)/filename
-            if path.suffix.lower() not in VIDEO_EXTENSIONS or path.is_symlink():
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            clips.append(dict(path=str(path), name=path.name, folder=str(path.parent.relative_to(root)),
-                              modified=stat.st_mtime, size=stat.st_size))
-            if len(clips) >= limit:
-                return clips, True, errors
+    for path, stat in media_files(root, cancel, VIDEO_EXTENSIONS, lambda exc: errors.append(str(exc))):
+        clips.append(dict(path=path, name=os.path.basename(path), folder=os.path.relpath(os.path.dirname(path), root),
+                          modified=stat.st_mtime, size=stat.st_size))
+        if len(clips) >= limit:
+            return clips, True, errors
+    if cancel.is_set():
+        return [], False, errors
     return clips, False, errors

@@ -1,10 +1,22 @@
 """Join completed clips with explicit compatibility checks and safe publication."""
 import os
 from pathlib import Path
-import subprocess
 import tempfile
 import threading
-from .media import probe, Edit, export_args, file_identity
+from .catalog import parse_clip_name
+from .media import probe, Edit, export_args, file_identity, run_ffmpeg
+
+
+def oldest_first(paths):
+    """Clips in the order they were recorded: by the date and time in a ClipNest file name,
+    else by the file's own date."""
+    def recorded(path):
+        parsed = parse_clip_name(Path(path).name)
+        try:
+            return parsed[1].timestamp() if parsed else os.stat(path).st_mtime
+        except (ValueError, OSError):
+            return 0.0
+    return sorted(paths, key=recorded)
 
 
 def copy_compatible(infos):
@@ -20,40 +32,7 @@ def copy_compatible(infos):
 
 
 def execute(args, duration, cancel, progress):
-    with tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=errors, text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
-        def read():
-            for line in process.stdout:
-                if line.startswith('out_time_us='):
-                    try:
-                        progress(min(99, max(0, float(line.split('=')[1])/duration/10000)))
-                    except ValueError:
-                        pass
-        reader = threading.Thread(target=read, daemon=True)
-        reader.start()
-        try:
-            while process.poll() is None:
-                if cancel.wait(.1):
-                    process.terminate()
-                    try:
-                        process.wait(3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    break
-            process.wait()
-            reader.join(3)
-            if cancel.is_set():
-                raise ValueError('Combine cancelled. Source clips are unchanged.')
-            if process.returncode:
-                errors.seek(0)
-                raise ValueError(errors.read()[-3000:].decode('utf-8', 'replace') or 'Combine failed.')
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            reader.join(3)
-            process.stdout.close()
+    run_ffmpeg(args, duration, cancel, progress, 'Combine cancelled. Source clips are unchanged.', 'Combine failed.')
 
 
 def combine(paths, ffmpeg, ffprobe, target, reencode=False, encoder='CPU H.264', bitrate=20000,

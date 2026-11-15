@@ -1,6 +1,5 @@
 """Editor preview, local-file drops and a compact waveform timeline."""
 from pathlib import Path
-import numpy as np
 from PySide6.QtCore import Qt, QRectF, Signal, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import QWidget
@@ -27,6 +26,7 @@ def filtered_image(image, crop, colors, source_size=None):
                            max(1, round(w*image.width()/sw)), max(1, round(h*image.height()/sh)))
     if colors == (0., 1., 1.):
         return image
+    import numpy as np  # only color previews need it, so opening ClipNest does not load it
     image = image.convertToFormat(QImage.Format.Format_RGBA8888)
     pixels = np.frombuffer(image.constBits(), dtype=np.uint8).reshape(image.height(), image.bytesPerLine())
     rgb = pixels[:, :image.width()*4].reshape(image.height(), image.width(), 4)[:, :, :3].astype(np.float32)/255
@@ -88,6 +88,12 @@ class VideoCanvas(QWidget):
         # One source image is retained for filter changes while paused.
         self.image = image
         self.refresh()
+
+    def clear(self):
+        """Drop the shown and any pending frame, before another clip loads."""
+        self.frame_timer.stop()
+        self.pending_frame = None
+        self.set_image(QImage())
 
     def refresh(self):
         self.display = filtered_image(self.image, self.crop if self.show_edits else None,

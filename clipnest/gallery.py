@@ -10,18 +10,17 @@ import tempfile
 import threading
 
 from PySide6.QtCore import Qt, QThread, Signal, QSize, QUrl, QTimer, QFile, QPointF
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QShortcut, QKeySequence, QImage, QGuiApplication, QPolygonF, QPen
+from PySide6.QtGui import (QIcon, QPixmap, QPainter, QColor, QShortcut, QKeySequence, QImage, QImageReader,
+                           QGuiApplication, QPolygonF, QPen)
 from PySide6.QtMultimedia import QMediaPlayer, QMediaMetaData, QVideoSink
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QListWidget, QListWidgetItem, QListView, QSlider, QMessageBox, QLineEdit, QCheckBox, QInputDialog, QComboBox)
+    QPushButton, QListWidget, QListWidgetItem, QListView, QSlider, QMessageBox, QLineEdit, QCheckBox, QComboBox)
 from .config import DATA
 from .editor_assets import thumbnail, captured_file
 from .media import tools_path
 from .preview import VIDEO_EXTENSIONS, VideoCanvas
-from .theme import apply_theme
-from .desktop import SmoothList, DefaultAudioOutput, show_centered, reveal_file, SeekSlider, same_file
-from .window_frame import DesktopWindow
-from .library import Annotations, matches, linked
+from .desktop import ClipActions, SmoothList, DefaultAudioOutput, reveal_file, SeekSlider, same_file
+from .library import Annotations, matches, media_files
 
 
 def clock(seconds):
@@ -31,43 +30,41 @@ def clock(seconds):
     return f'{hours}:{minutes:02}:{seconds:02}' if hours else f'{minutes:02}:{seconds:02}'
 
 
-def recent_clips(root, cancel, limit=24, exclude_paths=(), exclude_roots=(), game='', categories=None, accept=None):
-    """Scan every directory but retain only the newest completed files in memory."""
-    root = Path(root)
+def export_game(path):
+    """An export sits in the export folder rather than its game's folder, so its game is the start of the name
+    ClipNest gave the recording, like "Rocket League" in Rocket League_2026-11-10_08-14-57_217236_edited.mp4."""
+    from .catalog import parse_clip_name
+    parsed = parse_clip_name(os.path.basename(path))
+    return parsed[0] if parsed else os.path.basename(os.path.dirname(path))
+
+
+def recent_clips(root, cancel, limit=24, exclude_paths=(), exclude_roots=(), game='', categories=None, accept=None, label=None):
+    """Scan every directory but retain only the newest completed files in memory. A clip's game is its folder,
+    or label(path) when given."""
+    root = Path(root).resolve()  # links are never followed, so paths below a resolved root are already canonical
     found, errors = [], []
-    excluded = {Path(p).resolve() for p in exclude_paths}
-    excluded_roots = {Path(p).resolve() for p in exclude_roots}
-    for directory, folders, files in os.walk(root, onerror=lambda e: errors.append(str(e)), followlinks=False):
-        if cancel.is_set():
-            return [], errors
-        folders[:] = [f for f in folders if not f.startswith('.') and f not in ('_Unsorted', '_ReplayCache')
-                      and not linked(Path(directory)/f) and (Path(directory)/f).resolve() not in excluded_roots]
-        for name in files:
-            if cancel.is_set():
-                return [], errors
-            path = Path(directory)/name
-            if name.startswith('.') or path.suffix.lower() not in VIDEO_EXTENSIONS or path.is_symlink() or path.resolve() in excluded:
+    skip = {os.path.normcase(Path(p).resolve()) for p in (*exclude_paths, *exclude_roots)}
+    for path, stat in media_files(root, cancel, VIDEO_EXTENSIONS, lambda e: errors.append(str(e)), skip):
+        folder = label(path) if label else os.path.basename(os.path.dirname(path))
+        if categories is not None:
+            categories.add(folder)
+        if game and folder != game:
+            continue
+        clip = dict(path=path, name=os.path.basename(path), folder=folder,
+                    size=stat.st_size, modified=stat.st_mtime, stamp=stat.st_mtime_ns)
+        try:
+            # Search and favorites apply before the newest-N cap, like the game filter. Tags need the file id.
+            if accept is not None and not accept(Path(path), os.stat(path), clip):
                 continue
-            try:
-                stat = path.stat()
-                if not stat.st_size:
-                    continue
-                if categories is not None:
-                    categories.add(path.parent.name)
-                if game and path.parent.name != game:
-                    continue
-                clip = dict(path=str(path.resolve()), name=name, folder=path.parent.name,
-                            size=stat.st_size, modified=stat.st_mtime, stamp=stat.st_mtime_ns)
-                # Search and favorites apply before the newest-N cap, like the game filter.
-                if accept is not None and not accept(path, stat, clip):
-                    continue
-                entry = (stat.st_mtime_ns, str(path), clip)
-                if len(found) < limit:
-                    heapq.heappush(found, entry)
-                elif entry[:2] > found[0][:2]:
-                    heapq.heapreplace(found, entry)
-            except OSError:
-                continue
+        except OSError:
+            continue
+        entry = (stat.st_mtime_ns, path, clip)
+        if len(found) < limit:
+            heapq.heappush(found, entry)
+        elif entry[:2] > found[0][:2]:
+            heapq.heapreplace(found, entry)
+    if cancel.is_set():
+        return [], errors
     return [c for _, _, c in sorted(found, reverse=True)], errors
 
 
@@ -108,7 +105,8 @@ class GalleryScan(QThread):
         if self.exported:
             # An export folder may equal the recordings root; then only known
             # exports can be distinguished safely, never relabel every recording.
-            clips, errors = recent_clips(folder, self.cancel, limit=self.limit+1, game=self.game, categories=self.games, accept=accept) if folder.resolve() != Path(self.root).resolve() else ([], [])
+            clips, errors = recent_clips(folder, self.cancel, limit=self.limit+1, game=self.game, categories=self.games,
+                                         accept=accept, label=export_game) if folder.resolve() != Path(self.root).resolve() else ([], [])
             by_path = {c['path']: c for c in clips}
             for path in paths:
                 if self.cancel.is_set():
@@ -117,11 +115,12 @@ class GalleryScan(QThread):
                     if path.is_symlink() or not path.is_file():
                         continue
                     stat = path.stat()
-                    self.games.add(path.parent.name)
-                    if self.game and path.parent.name != self.game:
+                    game = export_game(path)
+                    self.games.add(game)
+                    if self.game and game != self.game:
                         continue
                     clip = dict(path=str(path.resolve()), name=path.name,
-                        folder=path.parent.name, size=stat.st_size, modified=stat.st_mtime, stamp=stat.st_mtime_ns)
+                        folder=game, size=stat.st_size, modified=stat.st_mtime, stamp=stat.st_mtime_ns)
                     if accept is None or accept(path, stat, clip):
                         by_path[clip['path']] = clip
                 except OSError:
@@ -186,10 +185,12 @@ def _cached_card_icon(thumbnail_path, stamp, label, ratio, favorite=False):
     canvas.setDevicePixelRatio(ratio)
     canvas.fill(QColor('#272727'))
     painter = QPainter(canvas)
-    picture = QImage(thumbnail_path)
+    # JPEG decodes straight at a fraction of the full-HD thumbnail's size, then smooth-scales the rest.
+    reader = QImageReader(thumbnail_path)
+    if reader.size().isValid():
+        reader.setScaledSize(reader.size().scaled(canvas.width(), canvas.height(), Qt.AspectRatioMode.KeepAspectRatio))
+    picture = reader.read()
     if not picture.isNull():
-        picture = picture.scaled(canvas.width(), canvas.height(), Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation)
         picture.setDevicePixelRatio(ratio)
         painter.drawImage(round((256-picture.width()/ratio)/2), round((144-picture.height()/ratio)/2), picture)
     else:
@@ -209,7 +210,82 @@ def _cached_card_icon(thumbnail_path, stamp, label, ratio, favorite=False):
     return QIcon(canvas)
 
 
-class RecentGallery(QWidget):
+class ClipDeletion:
+    """Delete the one selected clip to the Recycle Bin, shared by the galleries. The host keeps clip dicts in
+    self.clips, cards in self.list and self.items, and provides listed() and refresh()."""
+    def mark_deleting(self, item, on):
+        """Red border on the card being deleted, so it is clear which clip goes."""
+        if on:
+            from PySide6.QtCore import QRectF
+            item.setData(DELETE_ICON_ROLE, item.icon())
+            size = self.list.iconSize()
+            picture = item.icon().pixmap(size)
+            painter = QPainter(picture)
+            painter.setPen(QPen(QColor('#e53935'), 6))
+            painter.drawRect(QRectF(3, 3, size.width() - 6, size.height() - 6))
+            painter.end()
+            item.setIcon(QIcon(picture))
+        elif item.data(DELETE_ICON_ROLE) is not None:
+            item.setIcon(item.data(DELETE_ICON_ROLE))
+            item.setData(DELETE_ICON_ROLE, None)
+
+    def release_clip(self, path):
+        """The editor or the player page may still hold the file open; Windows then refuses the move."""
+        owner = self.window()
+        for name in ('editor', 'quick_player', 'game_gallery'):
+            holder = getattr(owner, name, None)
+            if holder is not None and hasattr(holder, 'release_file'):
+                holder.release_file(path)
+
+    def delete_selected(self):
+        selected = self.list.selectedItems()
+        if len(selected) != 1:
+            return
+        item = selected[0]
+        path = Path(item.data(Qt.ItemDataRole.UserRole))
+        if str(path) in self.pending_deletes:
+            return
+        self.mark_deleting(item, True)
+        answer = QMessageBox.question(self, 'Delete clip?',
+            f'Move this clip to the Recycle Bin?\n\n{path.name}\n\n{path.parent}',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel)
+        if answer != QMessageBox.StandardButton.Yes:
+            self.mark_deleting(item, False)
+            return
+        # Never fall back to permanent removal when trash is unavailable.
+        if path.is_symlink() or not path.is_file():
+            self.mark_deleting(item, False)
+            QMessageBox.warning(self, 'Clip was not deleted', 'The clip is missing or is no longer a regular file.')
+            return
+        self.release_clip(path)
+        self.pending_deletes.add(str(path))
+        self.try_trash(path, 0)
+
+    def try_trash(self, path, attempt):
+        """Move to the Recycle Bin, retrying on a timer while players close the file (they do so asynchronously)."""
+        if self.stopped:
+            self.pending_deletes.discard(str(path))
+            return
+        result = QFile.moveToTrash(str(path))
+        if result[0] if isinstance(result, tuple) else result:
+            self.pending_deletes.discard(str(path))
+            self.listed([clip for clip in self.clips if clip['path'] != str(path)], [])
+            self.refresh()
+            return
+        if attempt < DELETE_RETRIES:
+            QTimer.singleShot(DELETE_RETRY_MS, self, lambda: self.try_trash(path, attempt + 1))
+            return
+        # Never fall back to permanent removal when trash is unavailable.
+        self.pending_deletes.discard(str(path))
+        item = self.items.get(str(path))  # the list may have been redrawn while retrying
+        if item is not None:
+            self.mark_deleting(item, False)
+        QMessageBox.warning(self, 'Clip was not deleted',
+                            'Could not move the clip to the Recycle Bin. Another application may have it open; close it and try again.')
+
+
+class RecentGallery(ClipDeletion, ClipActions, QWidget):
     opened = Signal(object, int)
     def __init__(self, root, parent=None):
         super().__init__(parent)
@@ -219,6 +295,7 @@ class RecentGallery(QWidget):
         self.pending_deletes = set()
         self.clip_limit = 24
         self.has_more = False
+        self.tools_missing = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
@@ -347,77 +424,6 @@ class RecentGallery(QWidget):
             except OSError as exc:
                 QMessageBox.warning(self, 'Open file location', str(exc))
 
-    def mark_deleting(self, item, on):
-        """Red border on the card being deleted, so it is clear which clip goes."""
-        if on:
-            from PySide6.QtCore import QRectF
-            item.setData(DELETE_ICON_ROLE, item.icon())
-            size = self.list.iconSize()
-            picture = item.icon().pixmap(size)
-            painter = QPainter(picture)
-            painter.setPen(QPen(QColor('#e53935'), 6))
-            painter.drawRect(QRectF(3, 3, size.width() - 6, size.height() - 6))
-            painter.end()
-            item.setIcon(QIcon(picture))
-        elif item.data(DELETE_ICON_ROLE) is not None:
-            item.setIcon(item.data(DELETE_ICON_ROLE))
-            item.setData(DELETE_ICON_ROLE, None)
-
-    def release_clip(self, path):
-        """The editor or quick player may still hold the file open; Windows then refuses the move."""
-        owner = self.window()
-        for name in ('editor', 'quick_player'):
-            holder = getattr(owner, name, None)
-            if holder is not None and hasattr(holder, 'release_file'):
-                holder.release_file(path)
-
-    def delete_selected(self):
-        selected = self.list.selectedItems()
-        if len(selected) != 1:
-            return
-        item = selected[0]
-        path = Path(item.data(Qt.ItemDataRole.UserRole))
-        if str(path) in self.pending_deletes:
-            return
-        self.mark_deleting(item, True)
-        answer = QMessageBox.question(self, 'Delete clip?',
-            f'Move this clip to the Recycle Bin?\n\n{path.name}\n\n{path.parent}',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Cancel)
-        if answer != QMessageBox.StandardButton.Yes:
-            self.mark_deleting(item, False)
-            return
-        # Never fall back to permanent removal when trash is unavailable.
-        if path.is_symlink() or not path.is_file():
-            self.mark_deleting(item, False)
-            QMessageBox.warning(self, 'Clip was not deleted', 'The clip is missing or is no longer a regular file.')
-            return
-        self.release_clip(path)
-        self.pending_deletes.add(str(path))
-        self.try_trash(path, 0)
-
-    def try_trash(self, path, attempt):
-        """Move to the Recycle Bin, retrying on a timer while players close the file (they do so asynchronously)."""
-        if self.stopped:
-            self.pending_deletes.discard(str(path))
-            return
-        result = QFile.moveToTrash(str(path))
-        if result[0] if isinstance(result, tuple) else result:
-            self.pending_deletes.discard(str(path))
-            self.listed([clip for clip in self.clips if clip['path'] != str(path)], [])
-            self.refresh()
-            return
-        if attempt < DELETE_RETRIES:
-            QTimer.singleShot(DELETE_RETRY_MS, self, lambda: self.try_trash(path, attempt + 1))
-            return
-        # Never fall back to permanent removal when trash is unavailable.
-        self.pending_deletes.discard(str(path))
-        item = self.items.get(str(path))  # the list may have been redrawn while retrying
-        if item is not None:
-            self.mark_deleting(item, False)
-        QMessageBox.warning(self, 'Clip was not deleted',
-                            'Could not move the clip to the Recycle Bin. Another application may have it open; close it and try again.')
-
     def showEvent(self, event):
         super().showEvent(event)
         self.refresh()
@@ -437,6 +443,7 @@ class RecentGallery(QWidget):
             self.pending = True
             self.worker.cancel.set()
             return
+        self.tools_missing = None  # rechecked once per scan, not at every search keystroke
         self.storage.refresh()
         self.status.setText('Looking for recent clips…')
         self.worker = GalleryScan(self.root, self, self.exported, self.clip_limit, self.game_filter.currentData() or '',
@@ -456,12 +463,18 @@ class RecentGallery(QWidget):
             self.pending = False
             self.refresh()
 
+    def scan_worker(self):
+        """The scan that sent the current signal, or None when called directly. A delete calls listed() from
+        the Delete button or a retry timer; taking that sender for a scan failed and the list never redrew."""
+        sender = self.sender()
+        return sender if isinstance(sender, GalleryScan) else None
+
     def listed(self, clips, errors):
-        if self.stopped or (self.sender() and getattr(self.sender(), 'cancel', threading.Event()).is_set()):
+        worker = self.scan_worker()
+        if self.stopped or (worker is not None and worker.cancel.is_set()):
             return
         self.clips = clips
-        worker = self.sender()
-        if worker:
+        if worker is not None:
             self.has_more = worker.has_more
             selected = self.game_filter.currentData() or ''
             self.game_filter.blockSignals(True)
@@ -506,55 +519,21 @@ class RecentGallery(QWidget):
         self.update_more_button()
         filtered = bool(self.search.text().strip() or self.favorites.isChecked())
         text = f'{len(clips)} recent clips · Select a clip to delete · Double-click to watch' if clips else ('No clips match this search or filter.' if filtered else 'No exports found. Finished exports appear here automatically.' if self.exported else 'No saved clips yet. Your next saved clip will appear here.')
-
-        if not gallery_tools()[0]:
+        if self.tools_missing is None:
+            self.tools_missing = not gallery_tools()[0]
+        if self.tools_missing:
             text += ' · Set File → FFmpeg folder in the editor for thumbnails and clip details'
         self.status.setText(text)
 
-    def selected_paths(self):
-        return [item.data(Qt.ItemDataRole.UserRole) for item in self.list.selectedItems()]
+    def show_clips(self):
+        self.render_clips()
 
-    def favorite_selected(self):
-        paths = self.selected_paths()
-        selected = [c for c in self.clips if c['path'] in paths]
-        value = not all(c.get('favorite', False) for c in selected)
-        try:
-            for clip in selected:
-                self.annotations.set(clip['path'], favorite=value)
-                clip['favorite'] = value
-            self.render_clips()
-        except Exception as exc:
-            QMessageBox.warning(self, 'Favorites', str(exc))
-
-    def tag_selected(self):
-        paths = self.selected_paths()
-        if not paths:
-            return
-        first = next(c for c in self.clips if c['path'] == paths[0])
-        text, ok = QInputDialog.getText(self, 'Clip tags', 'Comma-separated tags (replaces tags on selected clips):', text=', '.join(first.get('tags', [])))
-        if ok:
-            try:
-                for clip in self.clips:
-                    if clip['path'] in paths:
-                        self.annotations.set(clip['path'], tags=text.split(','))
-                        clip['tags'] = [tag.strip() for tag in text.split(',') if tag.strip()]
-                self.render_clips()
-            except Exception as exc:
-                QMessageBox.warning(self, 'Tags', str(exc))
-
-    def combine_selected(self):
-        from .join_dialog import JoinDialog
-        paths = self.selected_paths()
-        if len(paths) < 2:
-            QMessageBox.information(self, 'Combine clips', 'Ctrl-click two or more clips first.')
-            return
-        dialog = JoinDialog(paths, self)
-        dialog.exec()
-        dialog.deleteLater()
+    def reload_clips(self):
         self.refresh()
 
     def asset_ready(self, path, details):
-        if self.stopped or (self.sender() and getattr(self.sender(), 'cancel', threading.Event()).is_set()):
+        worker = self.scan_worker()
+        if self.stopped or (worker is not None and worker.cancel.is_set()):
             return
         for clip in self.clips:
             if clip['path'] == path:
@@ -581,30 +560,26 @@ DELETE_ICON_ROLE = Qt.ItemDataRole.UserRole + 7
 DELETE_RETRIES, DELETE_RETRY_MS = 9, 100  # about one second for a player to close the file
 
 
-class QuickPlayer(DesktopWindow):
+class QuickPlayer(QWidget):
+    """Plays a clip on the Clips page, in place of the gallery. `closed` asks the window for the gallery again."""
     edit_requested = Signal(str)
+    closed = Signal()
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.Window)
-        self.setWindowTitle('ClipNest • Watch clip')
-        theme = getattr(parent, 'current_theme', parent.settings.get('ui_theme', 'dark')) if parent is not None and hasattr(parent, 'settings') else 'dark'
-        apply_theme(self, theme)
-        self.resize(1160, 760)
+        super().__init__(parent)
         self.clips, self.index = [], -1
         self.player = QMediaPlayer(self)
         self.audio = DefaultAudioOutput(self)
         self.audio.setVolume(.75)
         self.player.setAudioOutput(self.audio)
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         row = QHBoxLayout()
+        self.back_button = QPushButton('‹ Back to clips')
+        self.back_button.clicked.connect(self.back)
+        row.addWidget(self.back_button)
         self.title = QLabel('Clip')
-        self.title.setObjectName('pageTitle')
+        self.title.setStyleSheet('font-size: 13pt; font-weight: 650;')
         row.addWidget(self.title, 1)
-        close = QPushButton('Close')
-        close.clicked.connect(self.close)
-        row.addWidget(close)
         layout.addLayout(row)
         self.details = QLabel()
         self.details.setWordWrap(True)
@@ -619,7 +594,9 @@ class QuickPlayer(DesktopWindow):
         self.video.setMinimumSize(320, 180)
         self.player.setVideoSink(self.video_sink)
         from .playback_lifecycle import PlaybackLifecycle
+        from .frame_step import FrameStepper
         self.playback_lifecycle = PlaybackLifecycle(self, self.player, self.video)
+        self.frame_stepper = FrameStepper(self.player, self.video_sink)
         stage.addWidget(self.video, 0, 0)
         self.center_play = QPushButton('▶')
         self.center_play.setFixedSize(76, 76)
@@ -676,7 +653,9 @@ class QuickPlayer(DesktopWindow):
         self.player.playbackStateChanged.connect(self.state_changed)
         self.player.errorOccurred.connect(lambda *_: self.message.setText('Playback failed: '+self.player.errorString()))
         QShortcut(QKeySequence('Space'), self, activated=self.toggle)
-        QShortcut(QKeySequence('Escape'), self, activated=self.close)
+        QShortcut(QKeySequence('Escape'), self, activated=self.back)
+        QShortcut(QKeySequence('Left'), self, activated=lambda: self.frame_stepper.step(-1))
+        QShortcut(QKeySequence('Right'), self, activated=lambda: self.frame_stepper.step(1))
 
     def release_file(self, path):
         """Stop and release the clip if the gallery is deleting the one shown here."""
@@ -688,15 +667,12 @@ class QuickPlayer(DesktopWindow):
     def open_clips(self, clips, index):
         self.clips = [dict(c) for c in clips]
         self.open_index(index)
-        show_centered(self, self.parentWidget())
 
     def open_index(self, index):
         if not 0 <= index < len(self.clips):
             return
         self.player.stop()
-        self.video.frame_timer.stop()
-        self.video.pending_frame = None
-        self.video.set_image(QImage())
+        self.video.clear()
         self.index = index
         clip = self.clips[index]
         self.title.setTextFormat(Qt.TextFormat.PlainText)
@@ -708,7 +684,7 @@ class QuickPlayer(DesktopWindow):
         self.next.setEnabled(index+1 < len(self.clips))
         self.seek.setValue(0)
         self.time.setText('00:00 / '+clock(clip.get('duration', 0)))
-        self.message.setText('Space: play/pause · Esc: close · Edit clip opens the full editor')
+        self.message.setText('Space: play/pause · Left/Right: one frame back/forward · Esc: back to clips · Edit clip opens the full editor')
         if clip.get('thumbnail'):
             self.video.set_image(QImage(clip['thumbnail']))
         self.player.setSource(QUrl.fromLocalFile(clip['path']))
@@ -769,10 +745,16 @@ class QuickPlayer(DesktopWindow):
             self.player.pause()
             self.edit_requested.emit(self.clips[self.index]['path'])
 
-    def closeEvent(self, event):
+    def release(self):
+        """Stop and let go of the file, so it can be deleted or moved."""
         self.player.stop()
         self.player.setSource(QUrl())
-        self.video.frame_timer.stop()
-        self.video.pending_frame = None
-        self.video.set_image(QImage())
+        self.video.clear()
+
+    def back(self):
+        self.release()
+        self.closed.emit()
+
+    def closeEvent(self, event):
+        self.release()
         event.accept()

@@ -5,12 +5,19 @@ Windows Graphics Capture). VALORANT recorded by ClipNest 2.0.0-beta.6 showed the
 live desktop behind the game. The game layer hooks the game's own swap chain,
 but OBS keeps a hook attached after Alt-Tab, so ClipNest draws the layer only
 while the hooked game is the focused fullscreen window on the captured monitor.
+
+Only games that hide from capture are hooked. Every other game is already in the
+display capture, and closing a DirectX 12 game with the hook inside it hung the
+NVIDIA driver (2026-11-07).
 """
 import ctypes
 import os
 from ctypes import wintypes
 
 SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+# VALORANT shows in display capture for its first 10-20 minutes (menus, affinity 0) and hides
+# later; hooking it from the start keeps that switch from showing the desktop in a clip.
+HIDING_CLASSES = {"VALORANTUnrealWindow"}
 WS_MAXIMIZE, WS_BORDER = 0x01000000, 0x00800000
 EDD_GET_DEVICE_INTERFACE_NAME = 1
 MONITOR_DEFAULTTONEAREST = 2
@@ -32,6 +39,16 @@ def layer_wanted(window, target_device):
     if target_device is None:
         return True
     return window.get("device", "").casefold() == target_device.casefold()
+
+
+def hides_from_capture(window):
+    """Does display capture miss this window (WDA_MONITOR or WDA_EXCLUDEFROMCAPTURE)?
+
+    An unreadable affinity counts as hidden, so a game is never lost to a failed query.
+    """
+    if not window:
+        return False
+    return window.get("affinity", 0) != 0 or window.get("class") in HIDING_CLASSES
 
 
 def same_window_app(window, hook):
@@ -67,8 +84,12 @@ def user32():
         u.GetWindowLongPtrW.restype = ctypes.c_ssize_t
         u.MonitorFromRect.argtypes = [ctypes.POINTER(wintypes.RECT), wintypes.DWORD]
         u.MonitorFromRect.restype = wintypes.HMONITOR
+        u.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        u.MonitorFromWindow.restype = wintypes.HMONITOR
         u.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
         u.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
         u.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         u.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         u.EnumDisplayDevicesW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(DISPLAY_DEVICEW), wintypes.DWORD]
