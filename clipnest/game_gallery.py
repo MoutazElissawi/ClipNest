@@ -13,8 +13,8 @@ from PySide6.QtCore import Qt, QByteArray, QFileInfo, QRectF, QSize, QThread, QT
 from PySide6.QtGui import QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtMultimedia import QMediaPlayer, QVideoSink
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QFileIconProvider, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListView,
-    QListWidget, QListWidgetItem, QMenu, QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QFileIconProvider,QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListView,
+    QListWidget, QListWidgetItem, QMenu, QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from .config import DATA, atomic_json
 from .desktop import ClipActions, DefaultAudioOutput, SeekSlider, SmoothList, reveal_file, same_file, smooth_wheel
@@ -36,6 +36,8 @@ LINE_ICONS = {  # 24 x 24 strokes, drawn in the theme's colours
     'trash': '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3"/>',
     'star': '<path d="M12 2l3 6.6 7.2.8-5.4 4.9 1.5 7.1L12 17.8 5.7 21.4l1.5-7.1L1.8 9.4 9 8.6z"/>',
     'combine': '<path d="M6 4v5a6 6 0 0 0 6 6 6 6 0 0 0 6-6V4"/><path d="M12 15v5"/>',
+    'volume': '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
+    'muted': '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9l5 6M22 9l-5 6"/>',
     'monitor': '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
     'exports': '<path d="M12 3v12m0 0-4-4m4 4 4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>',
     'all': '<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
@@ -348,6 +350,15 @@ class GameRail(QWidget):
             self.search.wait()
 
 
+class StageVideo(VideoCanvas):
+    """The picture: a click plays or pauses, like the play button."""
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
 class ClipStage(QWidget):
     """The clip being watched: picture, a play button over it, and a seek bar."""
 
@@ -361,7 +372,8 @@ class ClipStage(QWidget):
         grid = QGridLayout(self)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(0)
-        self.video = VideoCanvas()
+        self.video = StageVideo()
+        self.video.clicked.connect(self.toggle)
         self.video.setAcceptDrops(False)
         self.video.show_edits = False
         self.video.setMinimumSize(320, 180)
@@ -390,8 +402,27 @@ class ClipStage(QWidget):
         self.resume = False
         self.time = QLabel('00:00 / 00:00')
         self.time.setObjectName('stageTime')
+        self.mute = QPushButton()
+        self.mute.setObjectName('stageMute')
+        self.mute.setFlat(True)
+        self.mute.setToolTip('Mute')
+        self.mute.setIconSize(QSize(20, 20))
+        self.mute.clicked.connect(lambda: self.audio.setMuted(not self.audio.isMuted()))
+        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume.setObjectName('stageVolume')
+        self.volume.setRange(0, 100)
+        self.volume.setValue(75)
+        self.volume.setFixedWidth(110)
+        self.volume.setToolTip('Volume')
+        self.volume.valueChanged.connect(lambda value: (self.audio.setVolume(value / 100), self.audio.setMuted(False)))
+        self.audio.mutedChanged.connect(self.show_volume)
+        self.audio.volumeChanged.connect(self.show_volume)
+        self.show_volume()
         bar.addWidget(self.seek, 1)
         bar.addWidget(self.time)
+        bar.addSpacing(12)
+        bar.addWidget(self.mute)
+        bar.addWidget(self.volume)
         grid.addLayout(bar, 1, 0)
         grid.setRowStretch(0, 1)
         self.player.durationChanged.connect(self.duration_changed)
@@ -429,6 +460,10 @@ class ClipStage(QWidget):
         self.player.setPosition(self.seek.value())
         if self.resume:
             self.player.play()
+
+    def show_volume(self, *_):
+        silent = self.audio.isMuted() or self.volume.value() == 0
+        self.mute.setIcon(line_icon('muted' if silent else 'volume', theme_color('text').name()))
 
     def duration_changed(self, duration):
         self.seek.setRange(0, duration)
@@ -475,6 +510,7 @@ QPushButton#clipDelete:hover { background: #3a1d1f; }
 QPushButton#clipEdit:disabled, QPushButton#clipDelete:disabled, QPushButton#clipAction:disabled,
 QPushButton#pickCombine:disabled, QPushButton#pickAction:disabled { color: #aaaaaa; background: transparent; border-color: #3b3b3b; }
 QPushButton#stagePlay { background: #76b900; color: #101500; border: 0; border-radius: 34px; font-size: 22px; }
+QPushButton#stageMute { background: transparent; border: 0; padding: 4px; min-height: 0; min-width: 0; }
 QWidget#pickBar { background: #101010; border: 1px solid #3b3b3b; border-radius: 28px; }
 QListWidget#gameCards { border: 0; background: transparent; }
 QListWidget#gameCards::item { background: transparent; border: 2px solid transparent; border-radius: 8px; padding: 4px; color: #aaaaaa; }
@@ -559,7 +595,8 @@ class GameGallery(ClipDeletion, ClipActions, QWidget):
         self.list.setUniformItemSizes(True)
         self.list.setWordWrap(False)
         self.list.itemSelectionChanged.connect(self.selection_changed)
-        self.list.itemActivated.connect(lambda item: self.stage.toggle())
+        self.list.itemClicked.connect(self.card_clicked)
+        self.opened_by_press = False
         for bar in (self.list.horizontalScrollBar(), self.list.verticalScrollBar()):
             bar.valueChanged.connect(self.load_more)
 
@@ -798,8 +835,16 @@ class GameGallery(ClipDeletion, ClipActions, QWidget):
             clip = next((c for c in self.clips if c['path'] == paths[0]), None)
             if clip is not None and (self.stage.clip is None or not same_file(self.stage.clip['path'], clip['path'])):
                 self.show_clip(clip)
+                # the click that chose this card only loads it
+                self.opened_by_press = bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
         for button in (self.edit_button, self.folder_button, self.delete_button):
             button.setEnabled(len(paths) == 1)
+
+    def card_clicked(self, item):
+        """Clicking the card that is showing plays or pauses it; Ctrl/Shift-clicks only select."""
+        opened, self.opened_by_press = self.opened_by_press, False
+        if not opened and QApplication.keyboardModifiers() == Qt.KeyboardModifier.NoModifier and len(self.selected_paths()) == 1:
+            self.stage.toggle()
 
     def clear_picks(self):
         """Keep only the clip that is playing selected. A redraw (after Favourite) leaves no current card."""
